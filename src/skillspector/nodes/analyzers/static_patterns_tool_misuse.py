@@ -708,6 +708,14 @@ def _consume_printf_invocation(
             # invocation or wrapper word. Its basename is not deterministic.
             return True, False
         command = word.casefold().rsplit("/", 1)[-1]
+        if _RUNTIME_SHELL_PARAMETER_SENTINEL in word and command in {
+            "printf",
+            "command",
+            "builtin",
+            "env",
+        }:
+            # A known basename does not make a runtime-selected executable exact.
+            return True, False
         if command == "printf":
             return True, True
         if command == "command":

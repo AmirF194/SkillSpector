@@ -1664,15 +1664,32 @@ def test_long_quoted_command_path_still_detects_destructive_basename() -> None:
     [
         "$(printf $FORMAT) -rf /",
         "$(printf ${FORMAT}) -rf /",
+        "$($BIN/printf echo) -rf /",
+        "$(${BIN}/printf echo) -rf /",
+        '$("$BIN/printf" echo) -rf /',
+        "$($BIN/env printf echo) -rf /",
+        "$($BIN/command printf echo) -rf /",
+        "$($BIN/builtin printf echo) -rf /",
         '`"${TOOL:-$(printf rm ' + " " * 300 + ')}"` -rf /',
     ],
-    ids=["runtime-format", "braced-runtime-format", "nested-parameter-reconstruction"],
+    ids=[
+        "runtime-format",
+        "braced-runtime-format",
+        "runtime-path",
+        "braced-runtime-path",
+        "quoted-runtime-path",
+        "runtime-env-path",
+        "runtime-command-path",
+        "runtime-builtin-path",
+        "nested-parameter-reconstruction",
+    ],
 )
 def test_runtime_printf_arguments_and_nested_reconstruction_stay_partial(content: str) -> None:
     result = static_runner.run_static_patterns_with_ledger(
         {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
     )
 
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
     assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
 
 
