@@ -1035,6 +1035,29 @@ def test_markdown_reference_to_parser_limited_target_keeps_cli_execution_success
     assert ae1[0]["location"]["start_line"] == 5
 
 
+def test_referenced_variable_documentation_does_not_create_coverage_gaps(tmp_path: Path) -> None:
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": (
+                "---\nname: reference-variables\ndescription: Variable documentation\n---\n"
+                "Read [references/usage.md](references/usage.md).\n"
+            ),
+            "references/usage.md": (
+                "Interpret `$ARGUMENTS` as the requested input.\n"
+                'In PowerShell, use `Test-Path "$($_.FullName)\\cli-path"`.\n'
+            ),
+        },
+    )
+
+    report = _scan_cli(tmp_path)
+
+    assert report["execution_successful"] is True
+    assert report["analysis_completeness"]["status"] == "complete"
+    assert report["analysis_completeness"]["ledger_exceptions"] == []
+    assert not any(issue["id"] == "AE1" for issue in report["issues"])
+
+
 @pytest.mark.asyncio
 async def test_changed_rule_family_negative_controls(tmp_path: Path) -> None:
     _write_bundle(
