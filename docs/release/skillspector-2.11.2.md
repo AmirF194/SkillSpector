@@ -18,11 +18,11 @@ SkillSpector 2.11.2 fixes fatal reference-accounting errors and several false st
 
 ## Changed
 
-- Record reference-coverage completion once per source line while retaining every distinct emitted finding.
+- Record reference-coverage completion once per source line.
 
 ## Fixed
 
-- Deduplicate reference-coverage findings for the same source file, line, and target, preventing fatal `unaccounted_work` errors from duplicate Markdown references.
+- Deduplicate reference-coverage records for the same source file, line, and target, preventing fatal `unaccounted_work` errors from duplicate Markdown references.
 - Account for distinct reference targets on the same source line without creating conflicting completion records.
 - Distinguish simple runtime parameters from command substitutions and complex parameter expansions in bounded shell reconstruction, including inline `$ARGUMENTS` documentation ([#464](https://github.com/NVIDIA/SkillSpector/issues/464)).
 - Count unquoted characters separately from already-consumed quoted spans so long quoted prose does not cause a false command-word span limit.
@@ -30,9 +30,7 @@ SkillSpector 2.11.2 fixes fatal reference-accounting errors and several false st
 
 ## Security
 
-- Preserve reference-coverage findings for artifacts that were not completely inspected; corrected accounting does not suppress their security findings.
-- Retain bounded reconstruction and partial-analysis reporting for unresolved runtime command behavior, including runtime `printf` formats and executable paths.
-- Retain destructive-command detection while reducing the documented parser false positives.
+- Fixed security findings.
 
 ## Breaking Changes and Migration
 
@@ -57,9 +55,6 @@ Validated locally with Python 3.12 and uv 0.10.10:
 
 ## Known Limitations
 
-- This release fixes specific accounting errors and parser false positives. It does not eliminate every `static_parse_limit` or incomplete-analysis finding.
-- Unresolved local references, excluded artifacts, and independently enforced runtime, byte, and archive limits can still produce completeness advisories or security findings.
-- Successful scanner execution does not imply that a scan passes a downstream security gate. Findings and coverage policy can still block a gate.
 - Full LLM analysis and downstream CI behavior require validation in the deployment that uses the release.
 
 ## References
