@@ -2132,6 +2132,7 @@ def _markdown_shell_text(
     """
     output = list(content)
     runs: list[tuple[int, int]] = []
+    list_marker = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t])")
 
     def mask_inline_delimiters() -> None:
         if not complete_context:
@@ -2174,6 +2175,25 @@ def _markdown_shell_text(
         stripped = line.rstrip(LINE_BREAK_CHARS)
         leading = stripped.lstrip(" \t")
         indentation = len(stripped[: len(stripped) - len(leading)].expandtabs(4))
+        # Interpret list padding in columns, preserving the original offsets.
+        # More than four columns after a marker can introduce indented code.
+        prefix = len(stripped) - len(leading)
+        column = indentation
+        list_indented = False
+        if indentation < 4:
+            while marker := list_marker.match(stripped, prefix):
+                check_runtime()
+                column += marker.end() - prefix
+                prefix = marker.end()
+                padding_start = column
+                while prefix < len(stripped) and stripped[prefix] in " \t":
+                    check_runtime()
+                    column += 4 - column % 4 if stripped[prefix] == "\t" else 1
+                    prefix += 1
+                if column - padding_start > 4:
+                    list_indented = True
+                    break
+            leading = stripped[prefix:]
         quote_start = indentation < 4 and leading.startswith(">")
         html_open = re.match(r"<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>])|[!?/])", leading)
         if html_end is not None:
@@ -2201,15 +2221,19 @@ def _markdown_shell_text(
                 if raw_tag
                 else "-->"
                 if leading.startswith("<!--")
+                else "?>"
+                if leading.startswith("<?")
+                else "]]>"
+                if leading.startswith("<![CDATA[")
+                else ">"
+                if re.match(r"<![A-Z]", leading)
                 else ""
             )
             html_end = None if terminator and terminator in leading.lower() else terminator
-        elif not leading or indentation >= 4:
+        elif not leading or indentation >= 4 or list_indented:
             mask_inline_delimiters()
         else:
-            # A list can begin a fenced block on the same line as its marker.
-            list_marker = re.match(r"[ ]{0,3}(?:[-+*]|[0-9]{1,9}[.)])[ \t]+", stripped)
-            prefix = list_marker.end() if list_marker else 0
+            # The body after any list markers can begin a fenced block.
             opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped[prefix:])
             if opening:
                 mask_inline_delimiters()

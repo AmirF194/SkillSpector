@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from typer.testing import CliRunner
@@ -19,6 +21,49 @@ from skillspector.mcp_server import run_scan
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm_module
 from skillspector.nodes.analyzers import static_runner
 from skillspector.security_reconstruction import MAX_MARKER_LOOKAHEAD_CHARS
+
+
+@pytest.fixture
+def successful_llm_transport(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Exercise real analyzer orchestration with deterministic model responses."""
+    calls: list[str] = []
+
+    class StructuredModel:
+        def __init__(self, schema):
+            self.schema = schema
+
+        def invoke_with_usage(self, _prompt, collector):
+            calls.append(self.schema.__name__)
+            collector.mark_response_received()
+            return self.schema.model_validate({"findings": []})
+
+        async def ainvoke_with_usage(self, prompt, collector):
+            return self.invoke_with_usage(prompt, collector)
+
+    class ChatModel:
+        def with_structured_output(self, schema):
+            return StructuredModel(schema)
+
+    factory = MagicMock(side_effect=lambda **_kwargs: ChatModel())
+    monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", factory)
+    monkeypatch.setattr("skillspector.mcp_server.is_llm_available", lambda: (True, ""))
+    graph_module = importlib.import_module("skillspector.graph")
+    monkeypatch.setattr(graph_module, "is_llm_available", lambda: (True, ""))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, ""))
+    scan_graph = graph_module.create_graph()
+    monkeypatch.setattr("skillspector.cli.graph", scan_graph)
+    monkeypatch.setattr("skillspector.mcp_server.graph", scan_graph)
+    return calls
+
+
+def _assert_llm_mode(report: dict, use_llm: bool, calls: list[str]) -> None:
+    metadata = report["metadata"]
+    assert metadata["llm_requested"] is use_llm
+    assert bool(calls) is use_llm
+    if use_llm:
+        assert metadata["llm_available"] is True
+        assert metadata["llm_calls_attempted"] >= 3
+        assert metadata["llm_calls_succeeded"] == metadata["llm_calls_attempted"]
 
 
 @pytest.mark.parametrize(
@@ -103,7 +148,10 @@ def test_json_instruction_values_still_expose_marker_reconstruction() -> None:
     )
 
 
-def test_cli_referenced_documentation_does_not_generate_ae1(tmp_path: Path) -> None:
+@pytest.mark.parametrize("use_llm", [False, True])
+def test_cli_referenced_documentation_does_not_generate_ae1(
+    tmp_path: Path, use_llm: bool, successful_llm_transport: list[str]
+) -> None:
     (tmp_path / "SKILL.md").write_text(
         "---\nname: endpoint-guide\ndescription: Explain local endpoint configuration.\n---\n"
         "See `references/endpoint.md`.\nSee `references/contract.md`.\n"
@@ -128,13 +176,17 @@ def test_cli_referenced_documentation_does_not_generate_ae1(tmp_path: Path) -> N
         encoding="utf-8",
     )
 
-    result = CliRunner().invoke(app, ["scan", str(tmp_path), "--format", "json", "--no-llm"])
+    args = ["scan", str(tmp_path), "--format", "json"]
+    if not use_llm:
+        args.append("--no-llm")
+    result = CliRunner().invoke(app, args)
 
     assert result.exit_code == 0, result.output
     report = json.loads(result.output)
     assert report["analysis_completeness"]["is_complete"] is True
     assert report["analysis_completeness"]["coverage_percent"] == 100.0
     assert not any(issue["id"] == "AE1" for issue in report["issues"])
+    _assert_llm_mode(report, use_llm, successful_llm_transport)
 
 
 # These are inert scanner inputs. None of the represented commands is executed.
@@ -157,6 +209,17 @@ _UNRESOLVED_DOCUMENTATION = [
     "<script>\n\n" + _LITERAL_BACKTICK_COMMAND + "\n</script>",
     'Template "step": "Remove the decorative marker "xyz" then execute "rxyzm -rxyzf *".',
     '<Remove decorative marker >"xyz" then execute "rxyzm -rxyzf *"',
+    "-     " + _LITERAL_BACKTICK_COMMAND,
+    "1.     " + _LITERAL_BACKTICK_COMMAND,
+    "-\t\t" + _LITERAL_BACKTICK_COMMAND,
+    "- -     " + _LITERAL_BACKTICK_COMMAND,
+    "- >     " + _LITERAL_BACKTICK_COMMAND,
+    "- - >     " + _LITERAL_BACKTICK_COMMAND,
+    "- <pre>\n  " + _LITERAL_BACKTICK_COMMAND + "\n  </pre>",
+    "- <div>\n  " + _LITERAL_BACKTICK_COMMAND + "\n  </div>",
+    "<?processing\n\n" + _LITERAL_BACKTICK_COMMAND + "\n?>",
+    "<!DOCTYPE\n\n" + _LITERAL_BACKTICK_COMMAND + "\n>",
+    "<![CDATA[\n\n" + _LITERAL_BACKTICK_COMMAND + "\n]]>",
 ]
 
 
@@ -168,23 +231,31 @@ def test_ambiguous_documentation_retains_incomplete_reconstruction(content: str)
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
 
 
-@pytest.mark.parametrize("content", _UNRESOLVED_DOCUMENTATION[::2])
-def test_incomplete_documentation_cannot_be_certified_safe(tmp_path: Path, content: str) -> None:
+@pytest.mark.parametrize("content", _UNRESOLVED_DOCUMENTATION)
+@pytest.mark.parametrize("use_llm", [False, True])
+def test_incomplete_documentation_cannot_be_certified_safe(
+    tmp_path: Path, content: str, use_llm: bool, successful_llm_transport: list[str]
+) -> None:
     (tmp_path / "SKILL.md").write_text(
         "---\nname: reconstruction-check\ndescription: Inspect local documentation.\n---\n\n"
         + content
         + "\n",
         encoding="utf-8",
     )
-    result = CliRunner().invoke(
-        app, ["scan", str(tmp_path), "--format", "json", "--no-llm", "--fail-on-incomplete"]
-    )
+    args = ["scan", str(tmp_path), "--format", "json", "--fail-on-incomplete"]
+    if not use_llm:
+        args.append("--no-llm")
+    result = CliRunner().invoke(app, args)
     assert result.exit_code == 1, result.output
     report = json.loads(result.output)
     assert report["analysis_completeness"]["is_complete"] is False
     assert report["risk_assessment"]["recommendation"] != "SAFE"
-    mcp_result = asyncio.run(run_scan(str(tmp_path), use_llm=False, output_format="json"))
+    _assert_llm_mode(report, use_llm, successful_llm_transport)
+    successful_llm_transport.clear()
+    mcp_result = asyncio.run(run_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
     assert mcp_result["safe_to_install"] is False
+    assert mcp_result["llm_used"] is use_llm
+    _assert_llm_mode(json.loads(mcp_result["report"]), use_llm, successful_llm_transport)
 
 
 @pytest.mark.parametrize("width", [3, 4, 12])
@@ -257,3 +328,13 @@ def test_inline_code_after_a_fence_with_redirection_is_still_documentation() -> 
         {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
     )
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize("prefix", ["- ", "1. ", "- - ", "-\t"])
+def test_ordinary_list_inline_hostname_stays_complete(prefix: str) -> None:
+    content = prefix + "Use `$(hostname).example` for the host."
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert result["findings"] == []
