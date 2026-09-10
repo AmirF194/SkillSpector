@@ -34,7 +34,13 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number
+from .common import (
+    LINE_BREAK_CHARS,
+    MARKDOWN_FENCE_CLOSE,
+    MARKDOWN_FENCE_OPEN,
+    get_context,
+    get_line_number,
+)
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -2115,11 +2121,80 @@ def _tm1_candidates(
             yield command_start, command_end, command, 0.9
 
 
+def _markdown_shell_text(content: str, check_runtime: Callable[[], None]) -> str:
+    """Mask Markdown delimiters while retaining code and exact source offsets.
+
+    Inline code delimiters are not legacy shell substitutions. Fenced and
+    indented code stays literal; longer inline delimiters preserve backticks
+    inside their bodies. Pair equal-length runs in linear time.
+    """
+    output = list(content)
+    runs: list[tuple[int, int]] = []
+
+    def mask_inline_delimiters() -> None:
+        next_by_length: dict[int, int] = {}
+        closing: dict[int, int] = {}
+        for index in range(len(runs) - 1, -1, -1):
+            start, end = runs[index]
+            length = end - start
+            if length in next_by_length:
+                closing[index] = next_by_length[length]
+            next_by_length[length] = index
+        index = 0
+        while index < len(runs):
+            check_runtime()
+            start, end = runs[index]
+            escape_start = start
+            while escape_start > 0 and content[escape_start - 1] == "\\":
+                escape_start -= 1
+            close_index = closing.get(index)
+            if (start - escape_start) % 2 or close_index is None:
+                index += 1
+                continue
+            close_start, close_end = runs[close_index]
+            output[start:end] = " " * (end - start)
+            output[close_start:close_end] = " " * (close_end - close_start)
+            index = close_index + 1
+        runs.clear()
+
+    fence: tuple[str, int] | None = None
+    offset = 0
+    for line in content.splitlines(keepends=True):
+        check_runtime()
+        stripped = line.rstrip(LINE_BREAK_CHARS)
+        if fence is not None:
+            closing_fence = MARKDOWN_FENCE_CLOSE.fullmatch(stripped)
+            if (
+                closing_fence
+                and closing_fence[1][0] == fence[0]
+                and len(closing_fence[1]) >= fence[1]
+            ):
+                output[offset : offset + len(stripped)] = " " * len(stripped)
+                fence = None
+        elif opening := MARKDOWN_FENCE_OPEN.fullmatch(stripped):
+            mask_inline_delimiters()
+            fence = (opening[1][0], len(opening[1]))
+            output[offset : offset + len(stripped)] = " " * len(stripped)
+        elif not stripped.strip() or line.startswith(("    ", "\t")):
+            mask_inline_delimiters()
+        else:
+            runs.extend(
+                (offset + match.start(), offset + match.end()) for match in re.finditer(r"`+", line)
+            )
+        offset += len(line)
+    mask_inline_delimiters()
+    return "".join(output)
+
+
 def has_bounded_parse_exhaustion(
     content: str,
     check_runtime: Callable[[], None],
+    *,
+    file_type: str = "shell",
 ) -> bool:
     """Return whether a destructive rm command exceeded the parser's span contract."""
+    if file_type == "markdown":
+        content = _markdown_shell_text(content, check_runtime)
     if _has_shell_command_word_exhaustion(content, check_runtime):
         return True
     covered_until = 0

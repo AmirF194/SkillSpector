@@ -168,6 +168,9 @@ _UNSUPPORTED_QUOTED_DIRECTIVE_START_RE: Final = re.compile(
     rf"(?P<quote>[{_QUOTE_OPEN_CLASS}])",
     re.IGNORECASE,
 )
+_JSON_STRING_VALUE_RE: Final = re.compile(
+    r'"(?:\\[^\r\n]|[^"\\\r\n])*"[ \t]*:[ \t]*"(?:\\[^\r\n]|[^"\\\r\n])*"'
+)
 _EMPTY_REPLACEMENT_DIRECTIVE_START_RE: Final = re.compile(
     rf"\b(?:{_REPLACEMENT_VERBS})\b{_DECLARED_MARKER_PREFIX}"
     rf"(?P<quote>[{_QUOTE_OPEN_CLASS}])",
@@ -444,9 +447,19 @@ def _quoted_directives(
     pattern: re.Pattern[str] = _QUOTED_DIRECTIVE_START_RE,
     unsupported_header: bool = False,
 ) -> Iterator[_Directive]:
+    # The fallback header can begin inside a JSON placeholder and mistake the
+    # value's closing quote for a marker opener (e.g. "<omit on first call>").
+    # Exclude only those structural closers, not the string's instruction text.
+    json_value_closers = (
+        {value.end() - 1 for value in _JSON_STRING_VALUE_RE.finditer(text)}
+        if unsupported_header
+        else set()
+    )
     for match in pattern.finditer(text):
         if check_runtime is not None:
             check_runtime()
+        if match.end() - 1 in json_value_closers:
+            continue
         quote = _QUOTE_OPEN_TO_CLOSE[match.group("quote")]
         marker_start = match.end()
         marker_end_limit = min(len(text), marker_start + MAX_MARKER_LOOKAHEAD_CHARS)

@@ -1302,6 +1302,7 @@ def _scan_all_views_detailed(
                                 exhaustion_hook(
                                     full_view.text,
                                     finding_budget.check_runtime,
+                                    file_type=_infer_file_type(path),
                                 )
                             )
                 except _StaticResourceLimitError as exc:
