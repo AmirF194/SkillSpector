@@ -116,8 +116,9 @@ class _DeadlineHookAfterMarkerModule(_ExpiringAfterMarkerModule):
         check_runtime: object,
         *,
         file_type: str,
+        complete_context: bool,
     ) -> bool:
-        del content, file_type
+        del content, file_type, complete_context
         self.hook_entered = True
         assert callable(check_runtime)
         check_runtime()

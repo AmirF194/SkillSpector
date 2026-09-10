@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from array import array
 from collections import Counter
@@ -439,6 +440,66 @@ def _compact_spaced_security_word_view(view: SecurityTextView) -> SecurityTextVi
     return SecurityTextView(f"marker-{view.name}", output.getvalue(), offsets)
 
 
+# Only bounded, complete JSON documents establish quote ownership. Arbitrary
+# key/value-looking prose is not a JSON representation.
+_MAX_JSON_QUOTE_CONTAINER_CHARS: Final = 65_536
+_JSON_FENCE_OPEN_RE: Final = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*json[ \t]*$", re.I)
+_JSON_FENCE_CLOSE_RE: Final = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*$")
+
+
+def _validated_json_ranges(
+    text: str, check_runtime: Callable[[], None] | None
+) -> list[tuple[int, int]]:
+    """Return standalone or explicitly fenced JSON ranges with proven syntax.
+
+    Decoder calls are bounded and bracketed by deadline checks. Oversized,
+    incomplete, invalid, and deeply nested inputs grant no quote ownership.
+    This is a correctness filter; quote discovery remains a separate step.
+    """
+
+    def reject_constant(value: str) -> None:
+        raise ValueError("Non-JSON numeric constant")
+
+    def valid(start: int, end: int) -> bool:
+        if check_runtime is not None:
+            check_runtime()
+        if end - start > _MAX_JSON_QUOTE_CONTAINER_CHARS:
+            return False
+        try:
+            decoded = json.loads(text[start:end], parse_constant=reject_constant)
+        except (ValueError, RecursionError):
+            result = False
+        else:
+            result = isinstance(decoded, (dict, list))
+        if check_runtime is not None:
+            check_runtime()
+        return result
+
+    if valid(0, len(text)):
+        return [(0, len(text))]
+    ranges: list[tuple[int, int]] = []
+    fence: tuple[str, int] | None = None
+    start = 0
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        if check_runtime is not None:
+            check_runtime()
+        stripped = line.rstrip("\r\n")
+        if fence is None:
+            opening = _JSON_FENCE_OPEN_RE.fullmatch(stripped)
+            if opening:
+                fence = (opening[1][0], len(opening[1]))
+                start = offset + len(line)
+        else:
+            closing = _JSON_FENCE_CLOSE_RE.fullmatch(stripped)
+            if closing and closing[1][0] == fence[0] and len(closing[1]) >= fence[1]:
+                if valid(start, offset):
+                    ranges.append((start, offset))
+                fence = None
+        offset += len(line)
+    return ranges
+
+
 def _quoted_directives(
     text: str,
     check_runtime: Callable[[], None] | None,
@@ -447,14 +508,18 @@ def _quoted_directives(
     pattern: re.Pattern[str] = _QUOTED_DIRECTIVE_START_RE,
     unsupported_header: bool = False,
 ) -> Iterator[_Directive]:
-    # The fallback header can begin inside a JSON placeholder and mistake the
-    # value's closing quote for a marker opener (e.g. "<omit on first call>").
-    # Exclude only those structural closers, not the string's instruction text.
-    json_value_closers = (
-        {value.end() - 1 for value in _JSON_STRING_VALUE_RE.finditer(text)}
-        if unsupported_header
-        else set()
-    )
+    # A complete JSON representation owns its closing quotes; JSON-looking
+    # fragments in prose and instructions do not. Keep discovery separate from
+    # validation so its runtime behavior can be repaired independently.
+    json_ranges = _validated_json_ranges(text, check_runtime) if unsupported_header else []
+    json_value_closers: set[int] = set()
+    if unsupported_header:
+        range_index = 0
+        for value in _JSON_STRING_VALUE_RE.finditer(text):
+            while range_index < len(json_ranges) and json_ranges[range_index][1] < value.end():
+                range_index += 1
+            if range_index < len(json_ranges) and json_ranges[range_index][0] <= value.start():
+                json_value_closers.add(value.end() - 1)
     for match in pattern.finditer(text):
         if check_runtime is not None:
             check_runtime()

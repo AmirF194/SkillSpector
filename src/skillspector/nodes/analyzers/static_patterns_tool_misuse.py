@@ -2121,7 +2121,9 @@ def _tm1_candidates(
             yield command_start, command_end, command, 0.9
 
 
-def _markdown_shell_text(content: str, check_runtime: Callable[[], None]) -> str:
+def _markdown_shell_text(
+    content: str, check_runtime: Callable[[], None], *, complete_context: bool = True
+) -> str:
     """Mask Markdown delimiters while retaining code and exact source offsets.
 
     Inline code delimiters are not legacy shell substitutions. Fenced and
@@ -2132,9 +2134,13 @@ def _markdown_shell_text(content: str, check_runtime: Callable[[], None]) -> str
     runs: list[tuple[int, int]] = []
 
     def mask_inline_delimiters() -> None:
+        if not complete_context:
+            runs.clear()
+            return
         next_by_length: dict[int, int] = {}
         closing: dict[int, int] = {}
         for index in range(len(runs) - 1, -1, -1):
+            check_runtime()
             start, end = runs[index]
             length = end - start
             if length in next_by_length:
@@ -2157,30 +2163,63 @@ def _markdown_shell_text(content: str, check_runtime: Callable[[], None]) -> str
             index = close_index + 1
         runs.clear()
 
+    # This is a conservative projection, not a general Markdown renderer.
+    # Container/HTML bodies with uncertain inline ownership remain literal.
     fence: tuple[str, int] | None = None
+    quoted_block = False
+    html_end: str | None = None
     offset = 0
     for line in content.splitlines(keepends=True):
         check_runtime()
         stripped = line.rstrip(LINE_BREAK_CHARS)
-        if fence is not None:
+        leading = stripped.lstrip(" \t")
+        indentation = len(stripped[: len(stripped) - len(leading)].expandtabs(4))
+        quote_start = indentation < 4 and leading.startswith(">")
+        html_open = re.match(r"<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>])|[!?/])", leading)
+        if html_end is not None:
+            mask_inline_delimiters()
+            if (html_end and html_end in leading.lower()) or (not html_end and not leading):
+                html_end = None
+        elif fence is not None:
             closing_fence = MARKDOWN_FENCE_CLOSE.fullmatch(stripped)
             if (
                 closing_fence
                 and closing_fence[1][0] == fence[0]
                 and len(closing_fence[1]) >= fence[1]
             ):
-                output[offset : offset + len(stripped)] = " " * len(stripped)
+                begin, end = closing_fence.span(1)
+                output[offset + begin : offset + end] = " " * (end - begin)
                 fence = None
-        elif opening := MARKDOWN_FENCE_OPEN.fullmatch(stripped):
+        elif quote_start or quoted_block:
             mask_inline_delimiters()
-            fence = (opening[1][0], len(opening[1]))
-            output[offset : offset + len(stripped)] = " " * len(stripped)
-        elif not stripped.strip() or line.startswith(("    ", "\t")):
+            quoted_block = bool(leading)
+        elif html_open:
+            mask_inline_delimiters()
+            raw_tag = re.match(r"<(pre|script|style|textarea)(?=[\s/>])", leading, re.I)
+            terminator = (
+                f"</{raw_tag[1].lower()}>"
+                if raw_tag
+                else "-->"
+                if leading.startswith("<!--")
+                else ""
+            )
+            html_end = None if terminator and terminator in leading.lower() else terminator
+        elif not leading or indentation >= 4:
             mask_inline_delimiters()
         else:
-            runs.extend(
-                (offset + match.start(), offset + match.end()) for match in re.finditer(r"`+", line)
-            )
+            # A list can begin a fenced block on the same line as its marker.
+            list_marker = re.match(r"[ ]{0,3}(?:[-+*]|[0-9]{1,9}[.)])[ \t]+", stripped)
+            prefix = list_marker.end() if list_marker else 0
+            opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped[prefix:])
+            if opening:
+                mask_inline_delimiters()
+                fence = (opening[1][0], len(opening[1]))
+                begin, end = opening.span(1)
+                output[offset + prefix + begin : offset + prefix + end] = " " * (end - begin)
+            else:
+                for match in re.finditer(r"`+", line):
+                    check_runtime()
+                    runs.append((offset + match.start(), offset + match.end()))
         offset += len(line)
     mask_inline_delimiters()
     return "".join(output)
@@ -2191,10 +2230,11 @@ def has_bounded_parse_exhaustion(
     check_runtime: Callable[[], None],
     *,
     file_type: str = "shell",
+    complete_context: bool = True,
 ) -> bool:
     """Return whether a destructive rm command exceeded the parser's span contract."""
     if file_type == "markdown":
-        content = _markdown_shell_text(content, check_runtime)
+        content = _markdown_shell_text(content, check_runtime, complete_context=complete_context)
     if _has_shell_command_word_exhaustion(content, check_runtime):
         return True
     covered_until = 0

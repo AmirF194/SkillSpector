@@ -1303,6 +1303,9 @@ def _scan_all_views_detailed(
                                     full_view.text,
                                     finding_budget.check_runtime,
                                     file_type=_infer_file_type(path),
+                                    # A fragment cannot prove surrounding HTML,
+                                    # container, or inline delimiter ownership.
+                                    complete_context=whole_artifact_window,
                                 )
                             )
                 except _StaticResourceLimitError as exc:
