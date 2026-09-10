@@ -73,6 +73,33 @@ def test_json_quote_no_match_scan_checks_runtime_during_work() -> None:
     assert checks == 2
 
 
+def test_json_quote_shared_whitespace_suffix_requires_linear_work() -> None:
+    class CountingText(str):
+        def __init__(self, value: str) -> None:
+            self.indexed_reads = 0
+            self.read_budget = 4 * len(value)
+
+        def __getitem__(self, key: int | slice) -> str:
+            value = super().__getitem__(key)
+            self.indexed_reads += len(value)
+            # Stop an accidental quadratic scan deterministically, without
+            # spending the full runtime budget on the regression fixture.
+            assert self.indexed_reads <= self.read_budget, "JSON scan repeated suffix work"
+            return value
+
+    previous_reads = 0
+    for size in (1000, 2000, 4000):
+        # All opening-quote candidates reach the same closing quote and long
+        # whitespace on both sides of a colon, followed by a non-string value.
+        text = CountingText(r"\"" * size + '"' + " " * size + ":" + "\t" * size + "x")
+
+        assert list(reconstruction._json_string_value_spans(text, None)) == []
+        assert text.indexed_reads > 0
+        if previous_reads:
+            assert text.indexed_reads <= 2 * previous_reads + 32
+        previous_reads = text.indexed_reads
+
+
 def test_json_quote_prepass_deadline_produces_runtime_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
