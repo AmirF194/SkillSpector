@@ -2166,7 +2166,7 @@ def _markdown_shell_text(
 
     # This is a conservative projection, not a general Markdown renderer.
     # Container/HTML bodies with uncertain inline ownership remain literal.
-    fence: tuple[str, int] | None = None
+    fence: tuple[str, int, int] | None = None
     quoted_block = False
     html_end: str | None = None
     offset = 0
@@ -2180,9 +2180,11 @@ def _markdown_shell_text(
         prefix = len(stripped) - len(leading)
         column = indentation
         list_indented = False
+        has_list_marker = False
         if indentation < 4:
             while marker := list_marker.match(stripped, prefix):
                 check_runtime()
+                has_list_marker = True
                 column += marker.end() - prefix
                 prefix = marker.end()
                 padding_start = column
@@ -2195,27 +2197,30 @@ def _markdown_shell_text(
                     break
             leading = stripped[prefix:]
         quote_start = indentation < 4 and leading.startswith(">")
-        html_open = re.match(r"<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>])|[!?/])", leading)
+        html_open = re.match(r"<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)|[!?/])", leading)
         if html_end is not None:
             mask_inline_delimiters()
             if (html_end and html_end in leading.lower()) or (not html_end and not leading):
                 html_end = None
         elif fence is not None:
-            closing_fence = MARKDOWN_FENCE_CLOSE.fullmatch(stripped)
+            fence_body = stripped.lstrip(" \t")
+            closing_fence = MARKDOWN_FENCE_CLOSE.fullmatch(fence_body)
             if (
                 closing_fence
+                and 0 <= indentation - fence[2] <= 3
                 and closing_fence[1][0] == fence[0]
                 and len(closing_fence[1]) >= fence[1]
             ):
                 begin, end = closing_fence.span(1)
-                output[offset + begin : offset + end] = " " * (end - begin)
+                body_start = offset + len(stripped) - len(fence_body)
+                output[body_start + begin : body_start + end] = " " * (end - begin)
                 fence = None
         elif quote_start or quoted_block:
             mask_inline_delimiters()
             quoted_block = bool(leading)
         elif html_open:
             mask_inline_delimiters()
-            raw_tag = re.match(r"<(pre|script|style|textarea)(?=[\s/>])", leading, re.I)
+            raw_tag = re.match(r"<(pre|script|style|textarea)(?=[\s/>]|$)", leading, re.I)
             terminator = (
                 f"</{raw_tag[1].lower()}>"
                 if raw_tag
@@ -2237,7 +2242,7 @@ def _markdown_shell_text(
             opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped[prefix:])
             if opening:
                 mask_inline_delimiters()
-                fence = (opening[1][0], len(opening[1]))
+                fence = (opening[1][0], len(opening[1]), column if has_list_marker else 0)
                 begin, end = opening.span(1)
                 output[offset + prefix + begin : offset + prefix + end] = " " * (end - begin)
             else:

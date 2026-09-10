@@ -220,6 +220,10 @@ _UNRESOLVED_DOCUMENTATION = [
     "<?processing\n\n" + _LITERAL_BACKTICK_COMMAND + "\n?>",
     "<!DOCTYPE\n\n" + _LITERAL_BACKTICK_COMMAND + "\n>",
     "<![CDATA[\n\n" + _LITERAL_BACKTICK_COMMAND + "\n]]>",
+    '<pre\nclass="example">\n\n' + _LITERAL_BACKTICK_COMMAND + "\n</pre>",
+    '<script\nclass="example">\n\n' + _LITERAL_BACKTICK_COMMAND + "\n</script>",
+    '<style\nclass="example">\n\n' + _LITERAL_BACKTICK_COMMAND + "\n</style>",
+    '<textarea\nclass="example">\n\n' + _LITERAL_BACKTICK_COMMAND + "\n</textarea>",
 ]
 
 
@@ -338,3 +342,23 @@ def test_ordinary_list_inline_hostname_stays_complete(prefix: str) -> None:
     )
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
     assert result["findings"] == []
+
+
+@pytest.mark.parametrize(
+    "opening,indent",
+    [("- - ```sh", "    "), ("10. ```sh", "    "), ("- - ```sh", "\t"), ("- ```sh", "  ")],
+)
+def test_list_fence_closes_before_following_inline_documentation(opening: str, indent: str) -> None:
+    content = opening + "\n" + indent + "echo harmless\n" + indent + "```\n\n"
+    content += "Use `$(hostname).example` for the host.\n"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize("opening,indent", [("   ```sh", "      "), ("- - ```sh", "        ")])
+def test_deeply_indented_marker_does_not_close_fence(opening: str, indent: str) -> None:
+    content = opening + "\n" + indent + "```\n" + _LITERAL_BACKTICK_COMMAND + "\n```\n"
+    projected = tm_module._markdown_shell_text(content, lambda: None)
+    assert _LITERAL_BACKTICK_COMMAND in projected
