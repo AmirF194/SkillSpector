@@ -169,9 +169,6 @@ _UNSUPPORTED_QUOTED_DIRECTIVE_START_RE: Final = re.compile(
     rf"(?P<quote>[{_QUOTE_OPEN_CLASS}])",
     re.IGNORECASE,
 )
-_JSON_STRING_VALUE_RE: Final = re.compile(
-    r'"(?:\\[^\r\n]|[^"\\\r\n])*"[ \t]*:[ \t]*"(?:\\[^\r\n]|[^"\\\r\n])*"'
-)
 _EMPTY_REPLACEMENT_DIRECTIVE_START_RE: Final = re.compile(
     rf"\b(?:{_REPLACEMENT_VERBS})\b{_DECLARED_MARKER_PREFIX}"
     rf"(?P<quote>[{_QUOTE_OPEN_CLASS}])",
@@ -500,6 +497,72 @@ def _validated_json_ranges(
     return ranges
 
 
+def _json_string_value_spans(
+    text: str, check_runtime: Callable[[], None] | None
+) -> Iterator[tuple[int, int]]:
+    """Discover key/string-value spans without repeatedly scanning quote suffixes.
+
+    This preserves the former regex's non-overlapping matches, including starts
+    at escaped quotes in malformed text. Callers establish structural ownership.
+    Cache each quoted body's end backwards, then inspect each distinct key end
+    once. Both passes are linear and yield to the artifact deadline.
+    """
+    if check_runtime is not None:
+        check_runtime()
+    if '"' not in text:
+        return
+    limit = len(text)
+    quote_ends: dict[int, int] = {}
+    next_quote = following_quote = limit
+    for index in range(limit - 1, -1, -1):
+        if index % 256 == 0 and check_runtime is not None:
+            check_runtime()
+        character = text[index]
+        if character == '"':
+            quote_ends[index] = next_quote
+            end = index
+        elif character in "\r\n":
+            end = limit
+        elif character == "\\":
+            end = following_quote if index + 1 < limit and text[index + 1] not in "\r\n" else limit
+        else:
+            end = next_quote
+        next_quote, following_quote = end, next_quote
+
+    value_ends: dict[int, int] = {}
+    covered_until = 0
+    # Insertion order is descending because the first pass walks backwards.
+    for position, start in enumerate(reversed(quote_ends)):
+        if position % 256 == 0 and check_runtime is not None:
+            check_runtime()
+        if start < covered_until:
+            continue
+        key_end = quote_ends[start]
+        if key_end == limit:
+            continue
+        value_end = value_ends.get(key_end)
+        if value_end is None:
+            cursor = key_end + 1
+            while cursor < limit and text[cursor] in " \t":
+                if cursor % 256 == 0 and check_runtime is not None:
+                    check_runtime()
+                cursor += 1
+            value_end = limit
+            if cursor < limit and text[cursor] == ":":
+                cursor += 1
+                while cursor < limit and text[cursor] in " \t":
+                    if cursor % 256 == 0 and check_runtime is not None:
+                        check_runtime()
+                    cursor += 1
+                value_end = quote_ends.get(cursor, limit)
+            value_ends[key_end] = value_end
+        if value_end < limit:
+            covered_until = value_end + 1
+            yield start, covered_until
+    if check_runtime is not None:
+        check_runtime()
+
+
 def _quoted_directives(
     text: str,
     check_runtime: Callable[[], None] | None,
@@ -515,11 +578,11 @@ def _quoted_directives(
     json_value_closers: set[int] = set()
     if unsupported_header:
         range_index = 0
-        for value in _JSON_STRING_VALUE_RE.finditer(text):
-            while range_index < len(json_ranges) and json_ranges[range_index][1] < value.end():
+        for start, end in _json_string_value_spans(text, check_runtime):
+            while range_index < len(json_ranges) and json_ranges[range_index][1] < end:
                 range_index += 1
-            if range_index < len(json_ranges) and json_ranges[range_index][0] <= value.start():
-                json_value_closers.add(value.end() - 1)
+            if range_index < len(json_ranges) and json_ranges[range_index][0] <= start:
+                json_value_closers.add(end - 1)
     for match in pattern.finditer(text):
         if check_runtime is not None:
             check_runtime()
