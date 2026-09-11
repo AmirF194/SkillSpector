@@ -443,8 +443,61 @@ def _compact_spaced_security_word_view(view: SecurityTextView) -> SecurityTextVi
 _MAX_JSON_QUOTE_CONTAINER_CHARS: Final = 65_536
 _JSON_FENCE_OPEN_RE: Final = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})([^\r\n]*)$")
 _JSON_FENCE_CLOSE_RE: Final = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*$")
-_JSON_LIST_PREFIX_RE: Final = re.compile(r"[ ]{0,3}(?:[-+*]|[0-9]{1,9}[.)])[ ]{1,4}(?![ \t])")
-_JSON_QUOTE_PREFIX_RE: Final = re.compile(r"[ ]{0,3}>[ ]?")
+_JSON_LIST_MARKER_RE: Final = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])")
+
+
+@dataclass
+class _JsonContainerCursor:
+    """Read container columns without expanding JSON or losing raw positions.
+
+    A consumed tab advances the raw index once; its remaining visual columns
+    stay in ``pending`` until another container or the validation copy uses
+    them. Tab stops therefore remain relative to the original line.
+    """
+
+    line: str
+    check_runtime: Callable[[], None] | None
+    index: int = 0
+    column: int = 0
+    pending: int = 0
+
+    def character(self) -> str:
+        if self.pending:
+            return " "
+        return self.line[self.index] if self.index < len(self.line) else ""
+
+    def advance(self) -> None:
+        if self.check_runtime is not None:
+            self.check_runtime()
+        if self.pending:
+            self.pending -= 1
+        else:
+            if self.line[self.index] == "\t":
+                self.pending = 3 - self.column % 4
+            self.index += 1
+        self.column += 1
+
+    def spaces(self, limit: int) -> int:
+        start = self.column
+        while self.column - start < limit and self.character() in (" ", "\t"):
+            self.advance()
+        return self.column - start
+
+    def quote(self) -> bool:
+        self.spaces(3)
+        if self.character() != ">":
+            return False
+        self.advance()
+        self.spaces(1)
+        return True
+
+    def remainder(self) -> str:
+        # Fence recognition needs at most four leading columns: the fourth
+        # proves overindentation. Only that bounded prefix is normalized;
+        # literal tabs after the JSON's first token remain untouched.
+        start = self.column
+        self.spaces(4)
+        return " " * (self.column - start + self.pending) + self.line[self.index :]
 
 
 def _json_fence_prefix(
@@ -452,20 +505,28 @@ def _json_fence_prefix(
 ) -> tuple[str, tuple[tuple[str, int], ...]]:
     """Recognize explicit container prefixes without changing source text."""
     context: list[tuple[str, int]] = []
-    cursor = 0
+    cursor = _JsonContainerCursor(line, check_runtime)
     while True:
         if check_runtime is not None:
             check_runtime()
-        quote = _JSON_QUOTE_PREFIX_RE.match(line, cursor)
-        item = _JSON_LIST_PREFIX_RE.match(line, cursor)
-        if quote:
+        start = cursor.index, cursor.column, cursor.pending
+        cursor.spaces(3)
+        if cursor.character() == ">":
             context.append(("quote", 0))
-            cursor = quote.end()
-        elif item:
-            context.append(("indent", item.end() - cursor))
-            cursor = item.end()
-        else:
-            return line[cursor:], tuple(context)
+            cursor.advance()
+            cursor.spaces(1)
+            continue
+        item = None if cursor.pending else _JSON_LIST_MARKER_RE.match(line, cursor.index)
+        if item is not None:
+            # The marker is bounded ASCII, so raw and visual widths agree.
+            cursor.column += item.end() - cursor.index
+            cursor.index = item.end()
+            padding = cursor.spaces(5)
+            if 1 <= padding <= 4:
+                context.append(("indent", cursor.column - start[1]))
+                continue
+        cursor.index, cursor.column, cursor.pending = start
+        return cursor.remainder(), tuple(context)
 
 
 def _json_fence_body(
@@ -476,22 +537,21 @@ def _json_fence_body(
     last_quote_index: int,
 ) -> str | None:
     """Remove only the opener's proven container prefixes for JSON validation."""
-    cursor = 0
+    cursor = _JsonContainerCursor(line, check_runtime)
     for index, (kind, width) in enumerate(context):
         if check_runtime is not None:
             check_runtime()
         if kind == "quote":
-            quote = _JSON_QUOTE_PREFIX_RE.match(line, cursor)
-            if quote is None:
+            if not cursor.quote():
                 return None
-            cursor = quote.end()
         else:
-            if line[cursor : cursor + width] != " " * width:
+            if cursor.spaces(width) != width:
                 # Empty list-body lines may omit indentation. A missing quote
                 # prefix is different: it ends that explicit container.
-                return "\n" if index > last_quote_index and not line[cursor:].strip() else None
-            cursor += width
-    return line[cursor:]
+                return (
+                    "\n" if index > last_quote_index and not line[cursor.index :].strip() else None
+                )
+    return cursor.remainder()
 
 
 def _json_body_after_frontmatter(text: str, check_runtime: Callable[[], None] | None) -> int | None:

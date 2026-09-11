@@ -2152,6 +2152,92 @@ def _markdown_block_separator(line: str, check_runtime: Callable[[], None]) -> b
     return count >= (3 if internal_gap or marker in {"*", "_"} else 1)
 
 
+def _markdown_table_cells(
+    line: str, start: int, check_runtime: Callable[[], None]
+) -> list[tuple[int, int]]:
+    """Locate GFM cells without copying content or changing source offsets."""
+    end = len(line)
+    while start < end and line[start] in " \t":
+        if start % 256 == 0:
+            check_runtime()
+        start += 1
+    while end > start and line[end - 1] in " \t":
+        if end % 256 == 0:
+            check_runtime()
+        end -= 1
+    if start == end:
+        return []
+    # Edge pipes are optional. In cmark-gfm a backslash immediately before a
+    # pipe escapes it even when that backslash follows another backslash.
+    if line[start] == "|":
+        start += 1
+    if line[end - 1] == "|" and (end == 1 or line[end - 2] != "\\"):
+        end -= 1
+    if start > end:
+        return []
+    cells: list[tuple[int, int]] = []
+    cell_start = start
+    for cursor in range(start, end):
+        if (cursor - start) % 256 == 0:
+            check_runtime()
+        if line[cursor] == "|" and (cursor == start or line[cursor - 1] != "\\"):
+            cells.append((cell_start, cursor))
+            cell_start = cursor + 1
+    cells.append((cell_start, end))
+    return cells
+
+
+def _markdown_table_delimiter_columns(
+    line: str, minimum_indent: int, check_runtime: Callable[[], None]
+) -> int | None:
+    """Prove a compatible delimiter row under the existing container scope."""
+    line = line.rstrip(LINE_BREAK_CHARS)
+    prefix = 0
+    column = 0
+    while prefix < len(line) and line[prefix] in " \t":
+        if prefix % 256 == 0:
+            check_runtime()
+        column += 4 - column % 4 if line[prefix] == "\t" else 1
+        prefix += 1
+    if column < minimum_indent or column >= 4 or prefix == len(line):
+        return None
+    if line[prefix] not in "|:-":
+        return None
+    # A new list item or a bare Setext/thematic underline takes precedence
+    # over table recognition, including a pipe-bearing preceding header.
+    if (
+        line[prefix] == "-" and prefix + 1 < len(line) and line[prefix + 1] in " \t"
+    ) or _markdown_block_separator(line, check_runtime):
+        return None
+    cells = _markdown_table_cells(line, prefix, check_runtime)
+    if not cells:
+        return None
+    for start, end in cells:
+        check_runtime()
+        while start < end and line[start] in " \t":
+            if start % 256 == 0:
+                check_runtime()
+            start += 1
+        while end > start and line[end - 1] in " \t":
+            if end % 256 == 0:
+                check_runtime()
+            end -= 1
+        if start < end and line[start] == ":":
+            start += 1
+        hyphen_start = start
+        while start < end and line[start] == "-":
+            if (start - hyphen_start) % 256 == 0:
+                check_runtime()
+            start += 1
+        if start == hyphen_start:
+            return None
+        if start < end and line[start] == ":":
+            start += 1
+        if start != end:
+            return None
+    return len(cells)
+
+
 def _markdown_shell_text(
     content: str, check_runtime: Callable[[], None], *, complete_context: bool = True
 ) -> str:
@@ -2164,6 +2250,7 @@ def _markdown_shell_text(
     output = list(content)
     runs: list[tuple[int, int]] = []
     list_marker = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t])")
+    backtick_runs = re.compile(r"`+")
 
     def mask_inline_delimiters() -> None:
         if not complete_context:
@@ -2202,8 +2289,13 @@ def _markdown_shell_text(
     html_end: str | None = None
     paragraph_open = False
     paragraph_in_list = False
+    paragraph_list_indent = 0
+    table_columns: int | None = None
+    table_minimum_indent = 0
+    table_delimiter_line = -1
     offset = 0
-    for line in content.splitlines(keepends=True):
+    lines = content.splitlines(keepends=True)
+    for line_index, line in enumerate(lines):
         check_runtime()
         stripped = line.rstrip(LINE_BREAK_CHARS)
         leading = stripped.lstrip(" \t")
@@ -2214,6 +2306,7 @@ def _markdown_shell_text(
         column = indentation
         list_indented = False
         has_list_marker = False
+        list_markers = 0
         if indentation < 4:
             while marker := list_marker.match(stripped, prefix):
                 check_runtime()
@@ -2228,6 +2321,7 @@ def _markdown_shell_text(
                     # Other numbers may be literal text within an inline span.
                     break
                 has_list_marker = True
+                list_markers += 1
                 column += marker.end() - prefix
                 prefix = marker.end()
                 padding_start = column
@@ -2242,8 +2336,32 @@ def _markdown_shell_text(
         quote_start = indentation < 4 and leading.startswith(">")
         heading = indentation < 4 and re.match(r"#{1,6}(?:[ \t]|$)", leading) is not None
         separator = indentation < 4 and _markdown_block_separator(stripped, check_runtime)
+        setext_only = separator and (leading.startswith("=") or leading.rstrip(" \t") == "--")
+        empty_list_item = (
+            not paragraph_open and re.fullmatch(r"(?:[-+*]|[0-9]{1,9}[.)])", leading) is not None
+        )
+        if table_columns is not None and setext_only:
+            # A table row has no paragraph for a Setext underline to close.
+            # Single '-' still starts an empty item; '---' remains thematic.
+            separator = False
         html_open = re.match(r"<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)|[!?/])", leading)
         continuing_paragraph = False
+        if table_columns is not None and (
+            html_end is not None
+            or fence is not None
+            or quote_start
+            or quoted_block
+            or html_open
+            or not leading
+            or indentation >= 4
+            or indentation < table_minimum_indent
+            or list_indented
+            or has_list_marker
+            or empty_list_item
+            or heading
+            or separator
+        ):
+            table_columns = None
         if html_end is not None:
             mask_inline_delimiters()
             if (html_end and html_end in leading.lower()) or (not html_end and not leading):
@@ -2295,18 +2413,65 @@ def _markdown_shell_text(
                 fence = (opening[1][0], len(opening[1]), column if has_list_marker else 0)
                 begin, end = opening.span(1)
                 output[offset + prefix + begin : offset + prefix + end] = " " * (end - begin)
-            elif not separator:
-                for match in re.finditer(r"`+", line):
-                    check_runtime()
-                    runs.append((offset + match.start(), offset + match.end()))
-                if heading:
+            else:
+                minimum_indent = (
+                    column if has_list_marker else paragraph_list_indent if paragraph_in_list else 0
+                )
+                if (
+                    table_columns is None
+                    and not heading
+                    and not empty_list_item
+                    and (not separator or setext_only and not paragraph_open)
+                    and list_markers <= 1
+                    and (has_list_marker or indentation >= minimum_indent)
+                    and line_index + 1 < len(lines)
+                ):
+                    columns = _markdown_table_delimiter_columns(
+                        lines[line_index + 1], minimum_indent, check_runtime
+                    )
+                    if (
+                        columns is not None
+                        and len(_markdown_table_cells(stripped, prefix, check_runtime)) == columns
+                    ):
+                        # Establish the header boundary before pairing any
+                        # opener from the preceding paragraph with this row.
+                        mask_inline_delimiters()
+                        # A Setext-looking line at a fresh block boundary is
+                        # a header only after the next row proves that role.
+                        separator = False
+                        table_columns = columns
+                        table_minimum_indent = minimum_indent
+                        table_delimiter_line = line_index + 1
+                if table_columns is not None:
                     mask_inline_delimiters()
-                else:
-                    continuing_paragraph = True
-                    paragraph_in_list = has_list_marker or paragraph_in_list
+                    if line_index != table_delimiter_line:
+                        cells = _markdown_table_cells(stripped, prefix, check_runtime)
+                        for cell_index, (cell_start, cell_end) in enumerate(cells):
+                            if cell_index >= table_columns:
+                                # GFM drops excess body cells: no rendered
+                                # inline node can grant ownership to their ticks.
+                                break
+                            for match in backtick_runs.finditer(stripped, cell_start, cell_end):
+                                check_runtime()
+                                runs.append((offset + match.start(), offset + match.end()))
+                            mask_inline_delimiters()
+                        if not cells:
+                            table_columns = None
+                elif not separator and not empty_list_item:
+                    for match in backtick_runs.finditer(line):
+                        check_runtime()
+                        runs.append((offset + match.start(), offset + match.end()))
+                    if heading:
+                        mask_inline_delimiters()
+                    else:
+                        continuing_paragraph = True
+                        paragraph_in_list = has_list_marker or paragraph_in_list
+                        if has_list_marker:
+                            paragraph_list_indent = column
         paragraph_open = continuing_paragraph
         if not paragraph_open:
             paragraph_in_list = False
+            paragraph_list_indent = 0
         offset += len(line)
     mask_inline_delimiters()
     return "".join(output)
@@ -2322,6 +2487,8 @@ def has_bounded_parse_exhaustion(
     """Return whether a destructive rm command exceeded the parser's span contract."""
     structural_quote_closers = None
     structural_quote_openers = None
+    json_strings: list[tuple[int, int]] = []
+    raw_content = content
     if file_type == "markdown":
         if complete_context:
             json_strings = validated_json_string_spans(content, check_runtime)
@@ -2352,6 +2519,22 @@ def has_bounded_parse_exhaustion(
         )
         covered_until = max(covered_until, command_end)
         if exhausted or _has_unsupported_brace_expansion(tokens):
+            return True
+    # A literal candidate outside a JSON string can consume it before the
+    # whole-content parser reaches its structural opener. Recover each proven
+    # string independently, without bypassing that parser's forward watermark
+    # and reparsing overlapping suffixes. These raw spans are disjoint and
+    # bounded by JSON validation; their projection retains both outer quotes
+    # and escaped bytes while preserving ordinary inline-code documentation.
+    for start, end in json_strings:
+        check_runtime()
+        projected = _markdown_shell_text(raw_content[start:end], check_runtime)
+        if _has_shell_command_word_exhaustion(
+            projected,
+            check_runtime,
+            structural_quote_openers={0},
+            structural_quote_closers={len(projected) - 1},
+        ):
             return True
     return False
 
