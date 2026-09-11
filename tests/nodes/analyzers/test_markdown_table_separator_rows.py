@@ -81,20 +81,33 @@ def test_real_block_interruptions_restore_paragraph_inline_ownership(middle: str
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
+@pytest.mark.parametrize(
+    "marker,complete",
+    [pytest.param("=", False, id="table-row"), pytest.param("+", True, id="empty-list")],
+)
 @pytest.mark.parametrize("use_llm", [False, True], ids=["no-llm", "llm"])
-def test_table_body_equals_remains_partial_through_cli_and_mcp(
-    tmp_path: Path, use_llm: bool, successful_llm_transport: list[str]
+def test_table_body_boundaries_through_cli_and_mcp(
+    tmp_path: Path,
+    marker: str,
+    complete: bool,
+    use_llm: bool,
+    successful_llm_transport: list[str],
 ) -> None:
     exit_code, mcp, reports = _public_results(
-        tmp_path, _source("="), use_llm, False, successful_llm_transport
+        tmp_path, _source(marker), use_llm, False, successful_llm_transport
     )
-    assert exit_code == 1
-    assert mcp["safe_to_install"] is False
+    assert exit_code == (0 if complete else 1)
+    assert mcp["safe_to_install"] is complete
     assert mcp["llm_used"] is use_llm
     for report in reports:
-        assert report["analysis_completeness"]["is_complete"] is False
-        assert report["risk_assessment"]["recommendation"] != "SAFE"
-        _assert_public_partial(report, False)
+        assert report["analysis_completeness"]["is_complete"] is complete
+        if complete:
+            assert report["analysis_completeness"]["coverage_percent"] == 100.0
+            assert report["risk_assessment"]["recommendation"] == "SAFE"
+            assert not any(issue["id"] == "AE1" for issue in report["issues"])
+        else:
+            assert report["risk_assessment"]["recommendation"] != "SAFE"
+            _assert_public_partial(report, False)
 
 
 def _header_source(preamble: str) -> str:
@@ -139,17 +152,60 @@ def test_real_blocks_cannot_be_promoted_to_table_headers(preamble: str) -> None:
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
+@pytest.mark.parametrize(
+    "marker,complete",
+    [
+        pytest.param("=", False, id="table-row"),
+        pytest.param("+", True, id="empty-list"),
+        pytest.param("+\n=", False, id="header-after-empty-list"),
+    ],
+)
 @pytest.mark.parametrize("use_llm", [False, True], ids=["no-llm", "llm"])
-def test_table_header_equals_remains_partial_through_cli_and_mcp(
-    tmp_path: Path, use_llm: bool, successful_llm_transport: list[str]
+def test_table_header_boundaries_through_cli_and_mcp(
+    tmp_path: Path,
+    marker: str,
+    complete: bool,
+    use_llm: bool,
+    successful_llm_transport: list[str],
 ) -> None:
     exit_code, mcp, reports = _public_results(
-        tmp_path, _header_source("="), use_llm, False, successful_llm_transport
+        tmp_path, _header_source(marker), use_llm, False, successful_llm_transport
     )
-    assert exit_code == 1
-    assert mcp["safe_to_install"] is False
+    assert exit_code == (0 if complete else 1)
+    assert mcp["safe_to_install"] is complete
     assert mcp["llm_used"] is use_llm
     for report in reports:
-        assert report["analysis_completeness"]["is_complete"] is False
-        assert report["risk_assessment"]["recommendation"] != "SAFE"
-        _assert_public_partial(report, False)
+        assert report["analysis_completeness"]["is_complete"] is complete
+        if complete:
+            assert report["analysis_completeness"]["coverage_percent"] == 100.0
+            assert report["risk_assessment"]["recommendation"] == "SAFE"
+            assert not any(issue["id"] == "AE1" for issue in report["issues"])
+        else:
+            assert report["risk_assessment"]["recommendation"] != "SAFE"
+            _assert_public_partial(report, False)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        pytest.param("*", id="star"),
+        pytest.param("+", id="plus"),
+        pytest.param("1.", id="ordered"),
+        pytest.param("+\n", id="blank-line-control"),
+    ],
+)
+def test_empty_list_item_does_not_open_a_paragraph_before_table_header(prefix: str) -> None:
+    source = _header_source(prefix + "\n=")
+    projected = tm_module._markdown_shell_text(source, lambda: None)
+    result = _scan(source)
+
+    # An empty item has no paragraph for the next '=' to underline. The
+    # following delimiter therefore establishes a new table header.
+    assert projected == source
+    assert any(
+        row["outcome"] is LedgerOutcome.PARTIAL
+        and row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+        and row["analyzer_id"] == "static_patterns_tool_misuse"
+        and row["path"] == "references/table.md"
+        for row in result["inspection_ledger"]
+    )
