@@ -437,130 +437,227 @@ def _compact_spaced_security_word_view(view: SecurityTextView) -> SecurityTextVi
     return SecurityTextView(f"marker-{view.name}", output.getvalue(), offsets)
 
 
-# Only bounded, complete JSON documents establish quote ownership. Arbitrary
-# key/value-looking prose is not a JSON representation.
+# Only bounded, complete JSON values establish quote ownership. Arbitrary
+# key/value-looking prose is not a JSON representation. Keep fence syntax
+# aligned with analyzers.common without importing its auto-discovered registry.
 _MAX_JSON_QUOTE_CONTAINER_CHARS: Final = 65_536
-_JSON_FENCE_OPEN_RE: Final = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*json[ \t]*$", re.I)
+_JSON_FENCE_OPEN_RE: Final = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})([^\r\n]*)$")
 _JSON_FENCE_CLOSE_RE: Final = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*$")
+_JSON_LIST_PREFIX_RE: Final = re.compile(r"[ ]{0,3}(?:[-+*]|[0-9]{1,9}[.)])[ ]{1,4}(?![ \t])")
+_JSON_QUOTE_PREFIX_RE: Final = re.compile(r"[ ]{0,3}>[ ]?")
+
+
+def _json_fence_prefix(
+    line: str, check_runtime: Callable[[], None] | None
+) -> tuple[str, tuple[tuple[str, int], ...]]:
+    """Recognize explicit container prefixes without changing source text."""
+    context: list[tuple[str, int]] = []
+    cursor = 0
+    while True:
+        if check_runtime is not None:
+            check_runtime()
+        quote = _JSON_QUOTE_PREFIX_RE.match(line, cursor)
+        item = _JSON_LIST_PREFIX_RE.match(line, cursor)
+        if quote:
+            context.append(("quote", 0))
+            cursor = quote.end()
+        elif item:
+            context.append(("indent", item.end() - cursor))
+            cursor = item.end()
+        else:
+            return line[cursor:], tuple(context)
+
+
+def _json_fence_body(
+    line: str,
+    context: tuple[tuple[str, int], ...],
+    check_runtime: Callable[[], None] | None,
+    *,
+    last_quote_index: int,
+) -> str | None:
+    """Remove only the opener's proven container prefixes for JSON validation."""
+    cursor = 0
+    for index, (kind, width) in enumerate(context):
+        if check_runtime is not None:
+            check_runtime()
+        if kind == "quote":
+            quote = _JSON_QUOTE_PREFIX_RE.match(line, cursor)
+            if quote is None:
+                return None
+            cursor = quote.end()
+        else:
+            if line[cursor : cursor + width] != " " * width:
+                # Empty list-body lines may omit indentation. A missing quote
+                # prefix is different: it ends that explicit container.
+                return "\n" if index > last_quote_index and not line[cursor:].strip() else None
+            cursor += width
+    return line[cursor:]
+
+
+def _json_body_after_frontmatter(text: str, check_runtime: Callable[[], None] | None) -> int | None:
+    """Recognize a bounded, explicitly delimited metadata prefix at offset zero.
+
+    This only identifies the JSON body's boundary. Manifest parsing continues
+    to validate metadata independently; none of its quotes acquires ownership.
+    """
+    prefix = text[:_MAX_JSON_QUOTE_CONTAINER_CHARS]
+    opening = re.match(r"\A---[ \t]*\r?\n", prefix)
+    if opening is None:
+        return None
+    offset = opening.end()
+    for line in prefix[offset:].splitlines(keepends=True):
+        if check_runtime is not None:
+            check_runtime()
+        # A complete delimiter line prevents a bounded prefix ending in the
+        # middle of a longer line from manufacturing a closing delimiter.
+        if line.endswith("\n") and line.rstrip("\r\n").rstrip(" \t") in {"---", "..."}:
+            return offset + len(line)
+        offset += len(line)
+    return None
 
 
 def _validated_json_ranges(
     text: str, check_runtime: Callable[[], None] | None
 ) -> list[tuple[int, int]]:
-    """Return standalone or explicitly fenced JSON ranges with proven syntax.
+    """Return raw source ranges whose complete JSON syntax has been validated.
 
-    Decoder calls are bounded and bracketed by deadline checks. Oversized,
-    incomplete, invalid, and deeply nested inputs grant no quote ownership.
-    This is a correctness filter; quote discovery remains a separate step.
+    List and blockquote prefixes are removed only in a bounded validation copy.
+    They contain no string delimiters, so quote offsets in the original ranges
+    remain exact. Invalid, incomplete, oversized and deeply nested containers
+    grant no ownership. Non-JSON fences also establish block boundaries.
     """
+
+    def check() -> None:
+        if check_runtime is not None:
+            check_runtime()
 
     def reject_constant(value: str) -> None:
         raise ValueError("Non-JSON numeric constant")
 
-    def valid(start: int, end: int) -> bool:
-        if check_runtime is not None:
-            check_runtime()
+    def valid(start: int, end: int, body: str | None = None) -> bool:
+        check()
         if end - start > _MAX_JSON_QUOTE_CONTAINER_CHARS:
             return False
         try:
-            decoded = json.loads(text[start:end], parse_constant=reject_constant)
+            json.loads(text[start:end] if body is None else body, parse_constant=reject_constant)
         except (ValueError, RecursionError):
             result = False
         else:
-            result = isinstance(decoded, (dict, list))
-        if check_runtime is not None:
-            check_runtime()
+            result = True
+        check()
         return result
 
     if valid(0, len(text)):
         return [(0, len(text))]
+    body_start = _json_body_after_frontmatter(text, check_runtime)
+    if body_start is not None and valid(body_start, len(text)):
+        return [(body_start, len(text))]
     ranges: list[tuple[int, int]] = []
-    fence: tuple[str, int] | None = None
+    fence: tuple[str, int, tuple[tuple[str, int], ...], bool] | None = None
+    body_lines: list[str] = []
+    last_quote_index = -1
     start = 0
     offset = 0
     for line in text.splitlines(keepends=True):
-        if check_runtime is not None:
-            check_runtime()
-        stripped = line.rstrip("\r\n")
+        check()
+        body = None
+        if fence is not None:
+            body = _json_fence_body(
+                line, fence[2], check_runtime, last_quote_index=last_quote_index
+            )
+            if body is None:
+                # The explicit container ended. Discard its partial payload,
+                # then consider this same line once as a new fence opener.
+                # No recursion, rewind or repeated suffix scan is needed.
+                fence = None
+                body_lines = []
         if fence is None:
-            opening = _JSON_FENCE_OPEN_RE.fullmatch(stripped)
-            if opening:
-                fence = (opening[1][0], len(opening[1]))
+            body, context = _json_fence_prefix(line.rstrip("\r\n"), check_runtime)
+            opening = _JSON_FENCE_OPEN_RE.fullmatch(body)
+            if opening and not (opening[1][0] == "`" and "`" in opening[2]):
+                language = opening[2].strip().split(maxsplit=1)
+                last_quote_index = -1
+                for index, (kind, _) in enumerate(context):
+                    check()
+                    if kind == "quote":
+                        last_quote_index = index
+                fence = (
+                    opening[1][0],
+                    len(opening[1]),
+                    context,
+                    bool(language and language[0].lower() == "json"),
+                )
                 start = offset + len(line)
+                body_lines = []
         else:
-            closing = _JSON_FENCE_CLOSE_RE.fullmatch(stripped)
+            assert body is not None
+            closing = _JSON_FENCE_CLOSE_RE.fullmatch(body.rstrip("\r\n"))
             if closing and closing[1][0] == fence[0] and len(closing[1]) >= fence[1]:
-                if valid(start, offset):
+                if fence[3] and valid(start, offset, "".join(body_lines)):
                     ranges.append((start, offset))
                 fence = None
+                body_lines = []
+            elif offset + len(line) - start <= _MAX_JSON_QUOTE_CONTAINER_CHARS:
+                if fence[3]:
+                    body_lines.append(body)
+            else:
+                body_lines = []
         offset += len(line)
     return ranges
 
 
-def _json_string_value_spans(
+def _json_string_spans(
     text: str, check_runtime: Callable[[], None] | None
 ) -> Iterator[tuple[int, int]]:
-    """Discover key/string-value spans without repeatedly scanning quote suffixes.
+    """Lex all complete JSON strings in one forward, escape-aware pass.
 
-    This preserves the former regex's non-overlapping matches, including starts
-    at escaped quotes in malformed text. Callers establish structural ownership.
-    Cache each quoted body's end backwards, then inspect each distinct key end
-    once. Both passes are linear and yield to the artifact deadline.
+    This intentionally includes array elements and object keys, unlike the old
+    key/string-value-pair grammar. Only the caller's validated ranges establish
+    ownership. Malformed prose still cannot grant structural quote ownership.
     """
-    if check_runtime is not None:
-        check_runtime()
-    if '"' not in text:
-        return
+    cursor = 0
     limit = len(text)
-    quote_ends: dict[int, int] = {}
-    next_quote = following_quote = limit
-    for index in range(limit - 1, -1, -1):
-        if index % 256 == 0 and check_runtime is not None:
-            check_runtime()
-        character = text[index]
-        if character == '"':
-            quote_ends[index] = next_quote
-            end = index
-        elif character in "\r\n":
-            end = limit
+    start: int | None = None
+    next_check = 0
+    while cursor < limit:
+        if cursor >= next_check:
+            if check_runtime is not None:
+                check_runtime()
+            next_check = cursor + 256
+        character = text[cursor]
+        if start is None:
+            if character == '"':
+                start = cursor
         elif character == "\\":
-            end = following_quote if index + 1 < limit and text[index + 1] not in "\r\n" else limit
-        else:
-            end = next_quote
-        next_quote, following_quote = end, next_quote
-
-    value_ends: dict[int, int] = {}
-    covered_until = 0
-    # Insertion order is descending because the first pass walks backwards.
-    for position, start in enumerate(reversed(quote_ends)):
-        if position % 256 == 0 and check_runtime is not None:
-            check_runtime()
-        if start < covered_until:
-            continue
-        key_end = quote_ends[start]
-        if key_end == limit:
-            continue
-        value_end = value_ends.get(key_end)
-        if value_end is None:
-            cursor = key_end + 1
-            while cursor < limit and text[cursor] in " \t":
-                if cursor % 256 == 0 and check_runtime is not None:
-                    check_runtime()
-                cursor += 1
-            value_end = limit
-            if cursor < limit and text[cursor] == ":":
-                cursor += 1
-                while cursor < limit and text[cursor] in " \t":
-                    if cursor % 256 == 0 and check_runtime is not None:
-                        check_runtime()
-                    cursor += 1
-                value_end = quote_ends.get(cursor, limit)
-            value_ends[key_end] = value_end
-        if value_end < limit:
-            covered_until = value_end + 1
-            yield start, covered_until
+            # JSON escapes consume the following character, including quotes.
+            # Unicode escape digits contain no delimiters; validation proves
+            # their syntax before these lexical spans can establish ownership.
+            cursor += 1
+        elif character == '"':
+            yield start, cursor + 1
+            start = None
+        elif character in "\r\n":
+            start = None
+        cursor += 1
     if check_runtime is not None:
         check_runtime()
+
+
+def validated_json_string_spans(
+    text: str, check_runtime: Callable[[], None] | None
+) -> list[tuple[int, int]]:
+    """Return exact string spans owned by complete JSON values, including both quotes."""
+    ranges = _validated_json_ranges(text, check_runtime)
+    spans: list[tuple[int, int]] = []
+    for start, end in ranges:
+        for string_start, string_end in _json_string_spans(text[start:end], check_runtime):
+            spans.append((start + string_start, start + string_end))
+    return spans
+
+
+def validated_json_string_closers(text: str, check_runtime: Callable[[], None] | None) -> set[int]:
+    """Return exact closing-quote offsets owned by complete JSON values."""
+    return {end - 1 for _, end in validated_json_string_spans(text, check_runtime)}
 
 
 def _quoted_directives(
@@ -572,17 +669,11 @@ def _quoted_directives(
     unsupported_header: bool = False,
 ) -> Iterator[_Directive]:
     # A complete JSON representation owns its closing quotes; JSON-looking
-    # fragments in prose and instructions do not. Keep discovery separate from
-    # validation so its runtime behavior can be repaired independently.
-    json_ranges = _validated_json_ranges(text, check_runtime) if unsupported_header else []
-    json_value_closers: set[int] = set()
-    if unsupported_header:
-        range_index = 0
-        for start, end in _json_string_value_spans(text, check_runtime):
-            while range_index < len(json_ranges) and json_ranges[range_index][1] < end:
-                range_index += 1
-            if range_index < len(json_ranges) and json_ranges[range_index][0] <= start:
-                json_value_closers.add(end - 1)
+    # fragments in prose and instructions do not. Only structural closing
+    # delimiters are excluded; instruction contents remain available below.
+    json_value_closers = (
+        validated_json_string_closers(text, check_runtime) if unsupported_header else set()
+    )
     for match in pattern.finditer(text):
         if check_runtime is not None:
             check_runtime()

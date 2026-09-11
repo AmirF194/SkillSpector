@@ -362,3 +362,223 @@ def test_deeply_indented_marker_does_not_close_fence(opening: str, indent: str) 
     content = opening + "\n" + indent + "```\n" + _LITERAL_BACKTICK_COMMAND + "\n```\n"
     projected = tm_module._markdown_shell_text(content, lambda: None)
     assert _LITERAL_BACKTICK_COMMAND in projected
+
+
+_REQUEST_PLACEHOLDER = "<omit on first request; reuse the returned identifier later>"
+_REQUEST_PADDING = "x" * 8292
+_REQUEST_OBJECT = json.dumps({"batch": _REQUEST_PLACEHOLDER, "padding": _REQUEST_PADDING})
+_DOCUMENTATION_BOUNDARY_CASES = [
+    pytest.param(json.dumps([_REQUEST_PLACEHOLDER, _REQUEST_PADDING]), True, id="json-array"),
+    pytest.param(
+        json.dumps({"batch": [_REQUEST_PLACEHOLDER, _REQUEST_PADDING]}),
+        True,
+        id="json-nested-array",
+    ),
+    pytest.param(
+        "```json\n" + json.dumps([_REQUEST_PLACEHOLDER, _REQUEST_PADDING]) + "\n```",
+        True,
+        id="json-fenced-array",
+    ),
+    pytest.param("- ```json\n  " + _REQUEST_OBJECT + "\n  ```", True, id="json-list-fence"),
+    pytest.param("> ```json\n> " + _REQUEST_OBJECT + "\n> ```", True, id="json-blockquote-fence"),
+    pytest.param("```json title=request\n" + _REQUEST_OBJECT + "\n```", True, id="json-fence-info"),
+    pytest.param("- `$(resolve_tool).example\n- ` -rf /", False, id="separate-list-items"),
+    pytest.param("# `$(resolve_tool).example\n# ` -rf /", False, id="separate-headings"),
+    pytest.param("Use `$(hostname).example` for the host name.", True, id="same-block-hostname"),
+    pytest.param(
+        "Run `$($(resolve_tool)/printf %s rm) -rf /`.", False, id="same-block-runtime-command"
+    ),
+    pytest.param("1. `$(resolve_tool).example\n2. ` -rf /", False, id="numbered-list-items"),
+    pytest.param("- - `$(resolve_tool).example\n- - ` -rf /", False, id="nested-list-items"),
+    pytest.param("- `$(resolve_tool).example\n+ ` -rf /", False, id="mixed-list-items"),
+    pytest.param("###### `$(resolve_tool).example\n###### ` -rf /", False, id="h6-headings"),
+    pytest.param("# `$(resolve_tool).example\n` -rf /", False, id="heading-to-paragraph"),
+    pytest.param("`$(resolve_tool).example\n# ` -rf /", False, id="paragraph-to-heading"),
+    pytest.param("`$(resolve_tool).example\n===\n` -rf /", False, id="setext-h1-boundary"),
+    pytest.param("`$(resolve_tool).example\n---\n` -rf /", False, id="setext-h2-boundary"),
+    pytest.param("`$(resolve_tool).example\n* * *\n` -rf /", False, id="thematic-break"),
+    pytest.param("- `$(resolve_tool).example\r\n- ` -rf /", False, id="crlf-list-items"),
+    pytest.param("`$(resolve_tool).example\n\n` -rf /", False, id="blank-line-boundary"),
+    pytest.param("`$(resolve_tool).example\n \t\n` -rf /", False, id="whitespace-boundary"),
+    pytest.param(
+        "Use `$(hostname).example\n/service` for the host.", True, id="multiline-paragraph"
+    ),
+    pytest.param("- Use `$(hostname).example\n  /service`.", True, id="multiline-list-item"),
+    pytest.param("- Use `$(hostname).example\n/service`.", True, id="lazy-list-continuation"),
+    pytest.param("####### Use `$(hostname).example\n/service`.", True, id="seven-hash-paragraph"),
+    pytest.param(
+        "Use `$(hostname).example\n2. /service`.", True, id="numeric-paragraph-continuation"
+    ),
+    pytest.param(
+        "Use `$(hostname).example\n12) /service`.", True, id="numbered-paragraph-continuation"
+    ),
+]
+
+
+@pytest.mark.parametrize("content,complete", _DOCUMENTATION_BOUNDARY_CASES)
+def test_documentation_json_and_block_boundary_contract(content: str, complete: bool) -> None:
+    """Inputs are inert source text: the represented commands are never executed."""
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+    entry = result["inspection_ledger"][0]
+    assert entry["outcome"] is (LedgerOutcome.COMPLETED if complete else LedgerOutcome.PARTIAL)
+    if complete:
+        assert result["findings"] == []
+    else:
+        assert entry["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize("content,complete", _DOCUMENTATION_BOUNDARY_CASES)
+@pytest.mark.parametrize("use_llm", [False, True], ids=["no-llm", "llm"])
+def test_documentation_json_and_block_boundaries_through_public_gates(
+    tmp_path: Path,
+    content: str,
+    complete: bool,
+    use_llm: bool,
+    successful_llm_transport: list[str],
+) -> None:
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: documentation-boundaries\ndescription: Inspect request documentation.\n"
+        "---\n\nSee `references/request.md`.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "references").mkdir()
+    (tmp_path / "references" / "request.md").write_text(content, encoding="utf-8")
+    args = ["scan", str(tmp_path), "--format", "json", "--fail-on-incomplete"]
+    if not use_llm:
+        args.append("--no-llm")
+    cli_result = CliRunner().invoke(app, args)
+    cli_report = json.loads(cli_result.output)
+    _assert_llm_mode(cli_report, use_llm, successful_llm_transport)
+    successful_llm_transport.clear()
+    mcp_result = asyncio.run(run_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
+    mcp_report = json.loads(mcp_result["report"])
+    _assert_llm_mode(mcp_report, use_llm, successful_llm_transport)
+
+    assert cli_result.exit_code == (0 if complete else 1), cli_result.output
+    assert mcp_result["safe_to_install"] is complete
+    assert mcp_result["llm_used"] is use_llm
+    for report in (cli_report, mcp_report):
+        assert report["analysis_completeness"]["is_complete"] is complete
+        if complete:
+            assert report["analysis_completeness"]["coverage_percent"] == 100.0
+            assert report["risk_assessment"]["recommendation"] == "SAFE"
+            assert not any(issue["id"] == "AE1" for issue in report["issues"])
+        else:
+            assert report["risk_assessment"]["recommendation"] != "SAFE"
+        if not use_llm:
+            assert report["metadata"].get("llm_calls_attempted", 0) == 0
+            assert report["metadata"].get("llm_calls_succeeded", 0) == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        json.dumps([_REQUEST_PLACEHOLDER, _REQUEST_PADDING]),
+        "> ```json\n> " + _REQUEST_OBJECT + "\n> ```",
+    ],
+    ids=["array", "blockquote-fence"],
+)
+@pytest.mark.parametrize("use_llm", [False, True], ids=["no-llm", "llm"])
+def test_entrypoint_json_is_complete_without_suppressing_other_findings(
+    tmp_path: Path,
+    content: str,
+    use_llm: bool,
+    successful_llm_transport: list[str],
+) -> None:
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: request-guide\ndescription: Inspect local request documentation.\n---\n\n"
+        + content
+        + "\n",
+        encoding="utf-8",
+    )
+    args = ["scan", str(tmp_path), "--format", "json", "--fail-on-incomplete"]
+    if not use_llm:
+        args.append("--no-llm")
+    cli_result = CliRunner().invoke(app, args)
+    cli_report = json.loads(cli_result.output)
+    _assert_llm_mode(cli_report, use_llm, successful_llm_transport)
+    successful_llm_transport.clear()
+    mcp_result = asyncio.run(run_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
+    mcp_report = json.loads(mcp_result["report"])
+    _assert_llm_mode(mcp_report, use_llm, successful_llm_transport)
+
+    assert cli_result.exit_code == 0, cli_result.output
+    # Complete inspection retains the existing risk score and findings. This
+    # fixture's score remains below the unchanged MCP installation threshold.
+    assert mcp_result["safe_to_install"] is True
+    for report in (cli_report, mcp_report):
+        assert report["analysis_completeness"]["is_complete"] is True
+        assert report["analysis_completeness"]["coverage_percent"] == 100.0
+        assert {"P9", "YR4"} <= {issue["id"] for issue in report["issues"]}
+        assert any(
+            issue["id"] == "YR4" and issue["severity"] == "HIGH" for issue in report["issues"]
+        )
+        assert not any(issue["id"] == "AE1" for issue in report["issues"])
+        assert report["risk_assessment"]["recommendation"] == "CAUTION"
+
+
+@pytest.mark.parametrize("container", ["array", "object", "json-fence", "list-json-fence"])
+def test_json_quote_ownership_keeps_dynamic_command_bodies_visible(container: str) -> None:
+    command = "$($(resolve_tool)/printf %s rm) -rf /"
+    body = json.dumps([command] if container == "array" else {"command": command})
+    if container == "json-fence":
+        body = "```json\n" + body + "\n```"
+    elif container == "list-json-fence":
+        body = "- ```json\n  " + body + "\n  ```"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": body}}, [tm_module]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "- `$(resolve_tool).example\n- ` -rf /",
+        "# `$(resolve_tool).example\n` -rf /",
+        "`$(resolve_tool).example\n===\n` -rf /",
+        "- `$(resolve_tool).example\r\n- ` -rf /",
+    ],
+)
+def test_block_boundaries_preserve_literal_source_coordinates(content: str) -> None:
+    assert tm_module._markdown_shell_text(content, lambda: None) == content
+
+
+def test_markdown_separator_scan_checks_deadline_during_whitespace() -> None:
+    checks = 0
+
+    def check_runtime() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 5:
+            raise TimeoutError("inert separator deadline")
+
+    # A long near-match must not spend quadratic time backtracking over spaces.
+    with pytest.raises(TimeoutError, match="inert separator deadline"):
+        tm_module._markdown_shell_text("***" + " " * 8192 + "x", check_runtime)
+    assert checks == 5
+
+
+@pytest.mark.parametrize("size", [1024, 2048, 4096])
+def test_markdown_separator_near_match_has_linear_work(size: int) -> None:
+    checks = 0
+
+    def check_runtime() -> None:
+        nonlocal checks
+        checks += 1
+
+    assert tm_module._markdown_block_separator("***" + " " * size + "x", check_runtime) is False
+    assert 1 <= checks <= size // 256 + 2
+
+
+def test_json_fragment_does_not_gain_whole_document_quote_ownership() -> None:
+    content = json.dumps([_REQUEST_PLACEHOLDER, _REQUEST_PADDING])
+    assert (
+        tm_module.has_bounded_parse_exhaustion(
+            content, lambda: None, file_type="markdown", complete_context=False
+        )
+        is True
+    )

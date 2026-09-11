@@ -7,9 +7,7 @@ from __future__ import annotations
 
 import json
 import random
-import re
 from collections.abc import Callable, Iterator
-from itertools import product
 
 import pytest
 
@@ -23,42 +21,34 @@ class _DeadlineReachedError(Exception):
     """Deterministic stand-in for the scanner's runtime-budget exception."""
 
 
-def test_json_quote_spans_preserve_legacy_grammar() -> None:
-    # Freeze the pre-optimization grammar independently of production code. The
-    # optimization must preserve malformed-input and non-overlap behavior too;
-    # structural quote ownership is a separate correctness change.
-    legacy = re.compile(r'"(?:\\[^\r\n]|[^"\\\r\n])*"[ \t]*:[ \t]*"(?:\\[^\r\n]|[^"\\\r\n])*"')
-    bodies = ["", "plain", r"escaped\"quote", r"two\\slashes", '"', "\n", "\r", "\\\n"]
-    corpus = [
-        '"a":"b":"c":"d"',
-        r'\"a":"b"',
-        r'"a\"":"b":"c"',
-        '"a\r\nb":"c"\r\n"valid":"pair"',
-        '"a"\r\n:"b"',
-        '"' + r"\"" * 32 + '"' + " " * 512 + "missing colon",
-        '"' + r"\"" * 32 + '"' + " " * 512 + ":" + "\t" * 512 + '"value"',
-    ]
-    corpus.extend(
-        f'prefix "{key}"{gap}:{gap}"{value}" suffix "next":"value"'
-        for key, value, gap in product(bodies, bodies, ["", " ", "\t", "\n", "\r"])
-    )
-    # Bounded, seeded malformed snippets exercise escaped opening quotes and
-    # overlapping candidate strings without running the quadratic oracle on
-    # the large runtime-regression inputs below.
+def test_json_quote_spans_match_independent_decoder_for_all_string_positions() -> None:
+    # The corrected contract includes keys, array elements and scalar strings;
+    # it intentionally expands the former key/string-value-pair grammar.
     rng = random.Random(516)
-    fragments = ['"', "\\", r"\"", r"\\", ":", " ", "\t", "\r", "\n", '"x":"y"']
-    corpus.extend("".join(rng.choices(fragments, k=16)) for _ in range(512))
-
-    for content in corpus:
-        expected = [match.span() for match in legacy.finditer(content)]
-        actual = list(reconstruction._json_string_value_spans(content, None))
-        assert actual == expected, repr(content)
+    bodies = ["", "plain", 'escaped"quote', "two\\slashes", "\n", "\r", "\t", "☃"]
+    bodies.extend("".join(rng.choices(['"', "\\", "a", " ", "\n"], k=16)) for _ in range(128))
+    documents = [bodies, {"nested": [bodies, {value: value for value in bodies}]}]
+    documents.extend(bodies)
+    decoder = json.JSONDecoder()
+    for document in documents:
+        for indent in (None, 2):
+            content = json.dumps(document, indent=indent)
+            expected = []
+            cursor = 0
+            while cursor < len(content):
+                if content[cursor] == '"':
+                    value, end = decoder.raw_decode(content, cursor)
+                    assert isinstance(value, str)
+                    expected.append((cursor, end))
+                    cursor = end
+                else:
+                    cursor += 1
+            assert list(reconstruction._json_string_spans(content, None)) == expected
 
 
 def test_json_quote_no_match_scan_checks_runtime_during_work() -> None:
-    # Every escaped quote used to start another unsuccessful regex search over
-    # the remaining suffix. The array has no key/string-value matches that
-    # could trigger a caller's deadline check after candidate discovery.
+    # Escaped quotes used to restart searches over the remaining suffix. The
+    # single long array string must yield to cancellation before its closer.
     content = json.dumps(['"' * 8192])
     checks = 0
 
@@ -69,7 +59,7 @@ def test_json_quote_no_match_scan_checks_runtime_during_work() -> None:
             raise _DeadlineReachedError
 
     with pytest.raises(_DeadlineReachedError):
-        list(reconstruction._json_string_value_spans(content, check_runtime))
+        list(reconstruction._json_string_spans(content, check_runtime))
     assert checks == 2
 
 
@@ -89,11 +79,12 @@ def test_json_quote_shared_whitespace_suffix_requires_linear_work() -> None:
 
     previous_reads = 0
     for size in (1000, 2000, 4000):
-        # All opening-quote candidates reach the same closing quote and long
-        # whitespace on both sides of a colon, followed by a non-string value.
+        # The old pair parser revisited a shared quote/whitespace suffix. The
+        # all-string lexer must also keep this malformed input linear.
         text = CountingText(r"\"" * size + '"' + " " * size + ":" + "\t" * size + "x")
 
-        assert list(reconstruction._json_string_value_spans(text, None)) == []
+        spans = list(reconstruction._json_string_spans(text, None))
+        assert all(0 <= start < end <= len(text) for start, end in spans)
         assert text.indexed_reads > 0
         if previous_reads:
             assert text.indexed_reads <= 2 * previous_reads + 32
@@ -103,7 +94,7 @@ def test_json_quote_shared_whitespace_suffix_requires_linear_work() -> None:
 def test_json_quote_prepass_deadline_produces_runtime_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original = reconstruction._json_string_value_spans
+    original = reconstruction._json_string_spans
     scanning_json_quotes = False
     quote_clock_checks = 0
 
@@ -115,7 +106,7 @@ def test_json_quote_prepass_deadline_produces_runtime_limit(
                 return 31.0
         return 0.0
 
-    def json_string_value_spans(
+    def json_string_spans(
         text: str,
         check_runtime: Callable[[], None] | None,
     ) -> Iterator[tuple[int, int]]:
@@ -135,7 +126,7 @@ def test_json_quote_prepass_deadline_produces_runtime_limit(
     # candidate discovery, independently of machine speed, container validation,
     # and processing of candidates already yielded to the caller.
     monkeypatch.setattr(static_runner.time, "monotonic", clock)
-    monkeypatch.setattr(reconstruction, "_json_string_value_spans", json_string_value_spans)
+    monkeypatch.setattr(reconstruction, "_json_string_spans", json_string_spans)
     content = json.dumps({"omit": "first request", "padding": ['"' * 8192]})
 
     findings, reason, metrics = static_runner._scan_all_views_detailed(

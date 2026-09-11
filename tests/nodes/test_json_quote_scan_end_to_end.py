@@ -108,17 +108,16 @@ async def test_json_quotes_preserve_public_verdict_across_scan_modes(
         assert verdict["recommendation"] != "SAFE"
         assert report["risk_assessment"]["recommendation"] != "SAFE"
     elif case == "escaped-quotes":
-        # The existing context-stuffing rule recognizes this deliberately
-        # repetitive fixture, and marker reconstruction treats its ambiguous
-        # key text as partial. Faster discovery must preserve both decisions.
+        # Validated JSON keys own their closing quotes too. The deliberately
+        # repetitive fixture still has its independent context-stuffing finding;
+        # correcting structural ownership must not remove that evidence. Its
+        # remaining advisory score is below the unchanged installation limit.
         assert tm1 == []
         assert any(finding["id"] == "MP2" for finding in verdict["findings"])
-        assert completeness["is_complete"] is False
-        assert {exception["reason_code"] for exception in completeness["ledger_exceptions"]} == {
-            LedgerReason.OBFUSCATED_INSTRUCTION_TEXT
-        }
-        assert verdict["safe_to_install"] is False
-        assert verdict["recommendation"] != "SAFE"
+        assert completeness["is_complete"] is True
+        assert completeness["ledger_exceptions"] == []
+        assert verdict["safe_to_install"] is True
+        assert verdict["recommendation"] == "SAFE"
     else:
         assert verdict["findings"] == []
         assert completeness["is_complete"] is True

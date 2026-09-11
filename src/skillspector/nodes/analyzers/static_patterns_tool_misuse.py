@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
@@ -1456,6 +1457,9 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
 def _has_shell_command_word_exhaustion(
     content: str,
     check_runtime: Callable[[], None],
+    *,
+    structural_quote_closers: set[int] | None = None,
+    structural_quote_openers: set[int] | None = None,
 ) -> bool:
     """Find candidate command words whose deterministic parse hit a safety bound."""
     parsed_through = 0
@@ -1465,7 +1469,14 @@ def _has_shell_command_word_exhaustion(
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
         check_runtime()
         start = candidate.start()
-        if start < parsed_through or not _is_shell_command_word_start(content, start):
+        if structural_quote_closers is not None and start in structural_quote_closers:
+            continue
+        json_string_start = structural_quote_openers is not None and (
+            start in structural_quote_openers or start - 1 in structural_quote_openers
+        )
+        if start < parsed_through or (
+            not json_string_start and not _is_shell_command_word_start(content, start)
+        ):
             continue
         if _has_quoted_assignment_prefix(content, start):
             continue
@@ -2121,6 +2132,26 @@ def _tm1_candidates(
             yield command_start, command_end, command, 0.9
 
 
+def _markdown_block_separator(line: str, check_runtime: Callable[[], None]) -> bool:
+    """Recognize Setext underlines/thematic breaks with bounded, linear work."""
+    line = line.strip(" \t")
+    marker = line[:1]
+    if marker not in {"=", "-", "*", "_"}:
+        return False
+    count = 0
+    internal_gap = False
+    for index, character in enumerate(line):
+        if index % 256 == 0:
+            check_runtime()
+        if character == marker:
+            count += 1
+        elif character in " \t" and marker != "=":
+            internal_gap = True
+        else:
+            return False
+    return count >= (3 if internal_gap or marker in {"*", "_"} else 1)
+
+
 def _markdown_shell_text(
     content: str, check_runtime: Callable[[], None], *, complete_context: bool = True
 ) -> str:
@@ -2169,6 +2200,8 @@ def _markdown_shell_text(
     fence: tuple[str, int, int] | None = None
     quoted_block = False
     html_end: str | None = None
+    paragraph_open = False
+    paragraph_in_list = False
     offset = 0
     for line in content.splitlines(keepends=True):
         check_runtime()
@@ -2184,6 +2217,16 @@ def _markdown_shell_text(
         if indentation < 4:
             while marker := list_marker.match(stripped, prefix):
                 check_runtime()
+                if (
+                    not has_list_marker
+                    and paragraph_open
+                    and not paragraph_in_list
+                    and marker[0][0].isdigit()
+                    and int(marker[0][:-1]) != 1
+                ):
+                    # Only a list starting at 1 can interrupt a paragraph.
+                    # Other numbers may be literal text within an inline span.
+                    break
                 has_list_marker = True
                 column += marker.end() - prefix
                 prefix = marker.end()
@@ -2197,7 +2240,10 @@ def _markdown_shell_text(
                     break
             leading = stripped[prefix:]
         quote_start = indentation < 4 and leading.startswith(">")
+        heading = indentation < 4 and re.match(r"#{1,6}(?:[ \t]|$)", leading) is not None
+        separator = indentation < 4 and _markdown_block_separator(stripped, check_runtime)
         html_open = re.match(r"<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)|[!?/])", leading)
+        continuing_paragraph = False
         if html_end is not None:
             mask_inline_delimiters()
             if (html_end and html_end in leading.lower()) or (not html_end and not leading):
@@ -2238,6 +2284,10 @@ def _markdown_shell_text(
         elif not leading or indentation >= 4 or list_indented:
             mask_inline_delimiters()
         else:
+            # Inline code may continue within a paragraph/list item, but cannot
+            # pair with delimiters in a new item, heading, or following block.
+            if has_list_marker or heading or separator:
+                mask_inline_delimiters()
             # The body after any list markers can begin a fenced block.
             opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped[prefix:])
             if opening:
@@ -2245,10 +2295,18 @@ def _markdown_shell_text(
                 fence = (opening[1][0], len(opening[1]), column if has_list_marker else 0)
                 begin, end = opening.span(1)
                 output[offset + prefix + begin : offset + prefix + end] = " " * (end - begin)
-            else:
+            elif not separator:
                 for match in re.finditer(r"`+", line):
                     check_runtime()
                     runs.append((offset + match.start(), offset + match.end()))
+                if heading:
+                    mask_inline_delimiters()
+                else:
+                    continuing_paragraph = True
+                    paragraph_in_list = has_list_marker or paragraph_in_list
+        paragraph_open = continuing_paragraph
+        if not paragraph_open:
+            paragraph_in_list = False
         offset += len(line)
     mask_inline_delimiters()
     return "".join(output)
@@ -2262,9 +2320,20 @@ def has_bounded_parse_exhaustion(
     complete_context: bool = True,
 ) -> bool:
     """Return whether a destructive rm command exceeded the parser's span contract."""
+    structural_quote_closers = None
+    structural_quote_openers = None
     if file_type == "markdown":
+        if complete_context:
+            json_strings = validated_json_string_spans(content, check_runtime)
+            structural_quote_closers = {end - 1 for _, end in json_strings}
+            structural_quote_openers = {start for start, _ in json_strings}
         content = _markdown_shell_text(content, check_runtime, complete_context=complete_context)
-    if _has_shell_command_word_exhaustion(content, check_runtime):
+    if _has_shell_command_word_exhaustion(
+        content,
+        check_runtime,
+        structural_quote_closers=structural_quote_closers,
+        structural_quote_openers=structural_quote_openers,
+    ):
         return True
     covered_until = 0
     for command_start, body_start in _destructive_command_words(content):
