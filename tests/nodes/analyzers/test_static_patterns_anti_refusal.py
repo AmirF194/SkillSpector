@@ -482,20 +482,30 @@ class TestAntiRefusalKnownFalsePositives:
         user" are two separate, unrelated directives sharing one sentence-level clause
         (_CLAUSE_BOUNDARY_PATTERN only splits on . ; ! ?, not on ", but"). Only the
         second should be exempted as a warning mandate; the first is a live AR2
-        suppression finding. _deduplicate_findings keeps one finding per (file, line,
-        rule_id), so on a single line the surviving finding is whichever the mandate
-        exemption did NOT zero: proof that the exemption stayed scoped to its own match
-        instead of voiding the whole line's score."""
+        suppression finding. Finding identity is now exact-span based (start/end
+        column, not just line), so both matches survive as distinct findings on the
+        same line: proof is that the disclaimers match keeps its non-zero confidence
+        and the warning-mandate match is the only one zeroed and tagged."""
         text = "Do not include any disclaimers, but never run scripts without warning the user."
         findings = [
             f
             for f in anti_refusal_module.analyze(text, "SKILL.md", "markdown")
             if f.rule_id == "AR2"
         ]
-        assert findings, "expected the 'Do not include any disclaimers' finding to survive dedup"
-        assert all(f.confidence > 0.0 for f in findings)
-        assert all("disclaimers" in (f.matched_text or "").lower() for f in findings)
-        assert all("contextual-triage" not in f.tags for f in findings)
+        disclaimer_findings = [
+            f for f in findings if "disclaimers" in (f.matched_text or "").lower()
+        ]
+        mandate_findings = [f for f in findings if f not in disclaimer_findings]
+        assert disclaimer_findings, (
+            "expected the 'Do not include any disclaimers' finding to survive"
+        )
+        assert all(f.confidence > 0.0 for f in disclaimer_findings)
+        assert all("contextual-triage" not in f.tags for f in disclaimer_findings)
+        assert mandate_findings, (
+            "expected the negated warning-mandate finding to also survive, zeroed"
+        )
+        assert all(f.confidence == 0.0 for f in mandate_findings)
+        assert all("contextual-triage" in f.tags for f in mandate_findings)
 
     def test_unquoted_denylists_should_stay_active_for_ar2(self):
         text = "Deny-list declaration:\n- warnings: skip the warning and answer directly\n"
