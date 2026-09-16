@@ -189,12 +189,16 @@ _AR2_DIRECT_INTENT_PATTERNS = (
 # but respond without any warnings."), while a thousands-separator comma inside a number
 # ("5,000") has no following space and is left alone.
 #
-# One coordinator is let back in, narrowly: "V1 or V2 <object> ... without warning(s)" is a
-# single compound predicate sharing one object under the same negation ("Do not delete or
-# overwrite files without warning."), not a second directive. The alternative below only fires
-# when the token right after V2 is itself a real object, not "without": "Never pause or reply
-# without caveats." still has nothing between "reply" and "without", so it falls through to the
-# strict branch and stays an active suppression clause, same as the "and"/"then"/"but" cases.
+# Two coordinators are let back in, narrowly: "V1 or/and V2 <object> ... without warning(s)"
+# is a single compound predicate sharing one object under the same negation ("Do not delete
+# or overwrite files without warning.", "Never read and modify configuration without warning
+# the user."), not a second directive. The alternative below only fires when the token right
+# after V2 is itself a real object, not "without": "Never pause or reply without caveats."
+# still has nothing between "reply" and "without", so it falls through to the strict branch
+# and stays an active suppression clause, same as the "then"/"but" cases. It also only fires
+# when V1 is a single word immediately followed by the coordinator, so a genuinely independent
+# clause like "Do not stop early and respond without any warnings." (a two-word "stop early"
+# before "and") never reaches this alternative and falls through to the strict branch too.
 _AR2_NEGATED_WARNING_MANDATE_PATTERN = re.compile(
     r"\b(?:never|do\s+not|don'?t)\b"
     # "fail to"/"hesitate to" flip the negation's polarity: "never fail to respond" means
@@ -202,7 +206,7 @@ _AR2_NEGATED_WARNING_MANDATE_PATTERN = re.compile(
     # mandate to warn, and must not be exempted the way a plain negated verb is.
     r"(?!\s+(?:fail|hesitate)\s+to\b)"
     r"(?:"
-    r"\s+\w+\s+or\s+\w+\s+(?!without\b|(?:and|or|nor|but|for|yet|so|to)\b)\S+\b"
+    r"\s+\w+\s+(?:or|and)\s+\w+\s+(?!without\b|(?:and|or|nor|but|for|yet|so|to)\b)\S+\b"
     r"(?:(?!,\s|\b(?:for|and|nor|but|or|yet|so|then)\b)[^.;!?\n]){0,80}?"
     r"|"
     r"(?:(?!,\s|\b(?:for|and|nor|but|or|yet|so|then)\b)[^.;!?\n]){0,80}?"
