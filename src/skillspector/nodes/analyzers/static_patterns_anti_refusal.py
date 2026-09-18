@@ -199,6 +199,10 @@ _AR2_DIRECT_INTENT_PATTERNS = (
 # when V1 is a single word immediately followed by the coordinator, so a genuinely independent
 # clause like "Do not stop early and respond without any warnings." (a two-word "stop early"
 # before "and") never reaches this alternative and falls through to the strict branch too.
+# V2 itself is rejected when it ends in "-ly": a real second verb in this slot ("overwrite",
+# "modify") is never an adverb, but "Do not stop and directly respond without any warnings."
+# would otherwise parse "directly" as V2 and "respond" as the shared object, laundering an
+# adverb-led independent action ("respond without any warnings") as part of the mandate.
 _AR2_NEGATED_WARNING_MANDATE_PATTERN = re.compile(
     r"\b(?:never|do\s+not|don'?t)\b"
     # "fail to"/"hesitate to" flip the negation's polarity: "never fail to respond" means
@@ -206,7 +210,7 @@ _AR2_NEGATED_WARNING_MANDATE_PATTERN = re.compile(
     # mandate to warn, and must not be exempted the way a plain negated verb is.
     r"(?!\s+(?:fail|hesitate)\s+to\b)"
     r"(?:"
-    r"\s+\w+\s+(?:or|and)\s+\w+\s+(?!without\b|(?:and|or|nor|but|for|yet|so|to)\b)\S+\b"
+    r"\s+\w+\s+(?:or|and)\s+(?!\w*ly\b)\w+\s+(?!without\b|(?:and|or|nor|but|for|yet|so|to)\b)\S+\b"
     r"(?:(?!,\s|\b(?:for|and|nor|but|or|yet|so|then)\b)[^.;!?\n]){0,80}?"
     r"|"
     r"(?:(?!,\s|\b(?:for|and|nor|but|or|yet|so|then)\b)[^.;!?\n]){0,80}?"
