@@ -199,10 +199,90 @@ _AR2_DIRECT_INTENT_PATTERNS = (
 # when V1 is a single word immediately followed by the coordinator, so a genuinely independent
 # clause like "Do not stop early and respond without any warnings." (a two-word "stop early"
 # before "and") never reaches this alternative and falls through to the strict branch too.
-# V2 itself is rejected when it ends in "-ly": a real second verb in this slot ("overwrite",
-# "modify") is never an adverb, but "Do not stop and directly respond without any warnings."
-# would otherwise parse "directly" as V2 and "respond" as the shared object, laundering an
-# adverb-led independent action ("respond without any warnings") as part of the mandate.
+# V2 itself is rejected when it is a member of _AR2_PRE_VERBAL_ADVERBS, a closed, explicit
+# word list, not a spelling test: an earlier version rejected any V2 candidate ending in
+# "-ly", and spelling is not a reliable part-of-speech signal in either direction. It let
+# "always" (an adverb that does not end in "-ly") launder a real suppression clause
+# ("Do not stop and always respond without any warnings." parsed as V1=stop, V2=always,
+# object=respond, zero-scoring the genuine "without any warnings" finding), and it wrongly
+# excluded "apply" (a real verb that happens to end in "-ly") from a genuine compound
+# predicate ("Do not copy or apply patches without warning the user." kept scoring as a
+# live AR2 finding instead of exempting). Membership below is scoped to the one syntactic
+# slot the pattern already anchors to (immediately after the "or"/"and" coordinator and
+# immediately before the shared-object token), so a word on the list can never suppress a
+# finding anywhere else in the pattern; a laundering adverb absent from the list is a false
+# negative in that slot only, never a false exemption caused by guessing from spelling.
+_AR2_PRE_VERBAL_ADVERBS = (
+    "always",
+    "often",
+    "usually",
+    "sometimes",
+    "occasionally",
+    "rarely",
+    "frequently",
+    "immediately",
+    "promptly",
+    "instantly",
+    "quickly",
+    "quietly",
+    "silently",
+    "secretly",
+    "covertly",
+    "directly",
+    "briefly",
+    "simply",
+    "merely",
+    "just",
+    "still",
+    "also",
+    "then",
+    "soon",
+    "eventually",
+    "finally",
+    "first",
+    "next",
+    "again",
+    "already",
+    "certainly",
+    "definitely",
+    "clearly",
+    "obviously",
+    "actually",
+    "really",
+    "probably",
+    "possibly",
+    "apparently",
+    "instead",
+    "otherwise",
+    "rather",
+    "calmly",
+    "politely",
+    "gently",
+    "swiftly",
+    "hastily",
+    "readily",
+    "eagerly",
+    "gladly",
+    "happily",
+    "willingly",
+    "voluntarily",
+    "unhesitatingly",
+    "obediently",
+    "dutifully",
+    "faithfully",
+    "loyally",
+    "unconditionally",
+    "unquestioningly",
+    "compliantly",
+    "automatically",
+    "deliberately",
+    "intentionally",
+    "knowingly",
+    "openly",
+    "privately",
+    "publicly",
+)
+_AR2_PRE_VERBAL_ADVERB_RE = "|".join(_AR2_PRE_VERBAL_ADVERBS)
 _AR2_NEGATED_WARNING_MANDATE_PATTERN = re.compile(
     r"\b(?:never|do\s+not|don'?t)\b"
     # "fail to"/"hesitate to" flip the negation's polarity: "never fail to respond" means
@@ -210,7 +290,8 @@ _AR2_NEGATED_WARNING_MANDATE_PATTERN = re.compile(
     # mandate to warn, and must not be exempted the way a plain negated verb is.
     r"(?!\s+(?:fail|hesitate)\s+to\b)"
     r"(?:"
-    r"\s+\w+\s+(?:or|and)\s+(?!\w*ly\b)\w+\s+(?!without\b|(?:and|or|nor|but|for|yet|so|to)\b)\S+\b"
+    r"\s+\w+\s+(?:or|and)\s+(?!(?:" + _AR2_PRE_VERBAL_ADVERB_RE + r")\b)\w+\s+"
+    r"(?!without\b|(?:and|or|nor|but|for|yet|so|to)\b)\S+\b"
     r"(?:(?!,\s|\b(?:for|and|nor|but|or|yet|so|then)\b)[^.;!?\n]){0,80}?"
     r"|"
     r"(?:(?!,\s|\b(?:for|and|nor|but|or|yet|so|then)\b)[^.;!?\n]){0,80}?"
